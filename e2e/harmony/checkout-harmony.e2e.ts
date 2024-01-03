@@ -6,6 +6,7 @@ import * as path from 'path';
 import { MissingBitMapComponent } from '../../src/consumer/bit-map/exceptions';
 import { NewerVersionFound } from '../../src/consumer/exceptions';
 import Helper, { FileStatusWithoutChalk } from '../../src/e2e-helper/e2e-helper';
+import { FILE_CHANGES_CHECKOUT_MSG } from '../../src/constants';
 
 chai.use(require('chai-fs'));
 
@@ -38,7 +39,7 @@ describe('bit checkout command', function () {
     });
     it('before tagging it should show an error saying the component was not tagged yet', () => {
       const output = helper.general.runWithTryCatch('bit checkout 1.0.0 bar/foo');
-      expect(output).to.have.string('component bar/foo is new, no version to checkout');
+      expect(output).to.have.string('is new, no version to checkout');
     });
     describe('after the component was tagged', () => {
       before(() => {
@@ -47,7 +48,7 @@ describe('bit checkout command', function () {
       describe('using a non-exist version', () => {
         it('should show an error saying the version does not exist', () => {
           const output = helper.general.runWithTryCatch('bit checkout 1.0.0 bar/foo');
-          expect(output).to.have.string("component bar/foo doesn't have version 1.0.0");
+          expect(output).to.have.string("bar/foo doesn't have version 1.0.0");
         });
       });
       describe('and component was modified', () => {
@@ -56,7 +57,7 @@ describe('bit checkout command', function () {
         });
         it('should show an error saying the component already uses that version', () => {
           const output = helper.general.runWithTryCatch('bit checkout 0.0.5 bar/foo');
-          expect(output).to.have.string('component bar/foo is already at version 0.0.5');
+          expect(output).to.have.string('bar/foo is already at version 0.0.5');
         });
         describe('and tagged again', () => {
           let output;
@@ -96,7 +97,7 @@ describe('bit checkout command', function () {
             it('should throw an error NewerVersionFound', () => {
               const tagFunc = () => helper.command.tagComponent('bar/foo');
               const error = new NewerVersionFound([
-                { componentId: 'bar/foo', currentVersion: '0.0.5', latestVersion: '0.0.10' },
+                { componentId: `${helper.scopes.remote}/bar/foo`, currentVersion: '0.0.5', latestVersion: '0.0.10' },
               ]);
               helper.general.expectToThrow(tagFunc, error);
             });
@@ -228,7 +229,7 @@ describe('bit checkout command', function () {
     });
     describe('bit checkout head', () => {
       before(() => {
-        helper.command.checkoutHead('comp1 --skip-npm-install');
+        helper.command.checkoutHead('comp1 --skip-dependency-installation');
       });
       it('should leave the file deleted', () => {
         const deletedFile = path.join(helper.scopes.localPath, 'comp1/foo.ts');
@@ -238,7 +239,7 @@ describe('bit checkout command', function () {
     describe('bit checkout reset', () => {
       before(() => {
         helper.scopeHelper.getClonedLocalScope(scopeBeforeCheckout);
-        helper.command.checkoutReset('comp1 --skip-npm-install');
+        helper.command.checkoutReset('comp1 --skip-dependency-installation');
       });
       it('should re-create the file', () => {
         const deletedFile = path.join(helper.scopes.localPath, 'comp1/foo.ts');
@@ -282,7 +283,7 @@ describe('bit checkout command', function () {
     describe('using manual strategy', () => {
       let output;
       before(() => {
-        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--manual');
+        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve manual');
       });
       it('should indicate that the file has conflicts', () => {
         expect(output).to.have.string(successOutput);
@@ -328,7 +329,7 @@ describe('bit checkout command', function () {
       let output;
       before(() => {
         helper.scopeHelper.getClonedLocalScope(localScope);
-        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--theirs');
+        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve theirs');
       });
       it('should indicate that the file has updated', () => {
         expect(output).to.have.string(successOutput);
@@ -354,7 +355,7 @@ describe('bit checkout command', function () {
       let output;
       before(() => {
         helper.scopeHelper.getClonedLocalScope(localScope);
-        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--ours');
+        output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve ours');
       });
       it('should indicate that the version was switched', () => {
         expect(output).to.have.string(successOutput);
@@ -362,7 +363,7 @@ describe('bit checkout command', function () {
         expect(output).to.have.string('bar/foo');
       });
       it('should indicate that the file was not changed', () => {
-        expect(output).to.have.string(FileStatusWithoutChalk.unchanged);
+        expect(output).to.not.have.string(FILE_CHANGES_CHECKOUT_MSG);
       });
       it('should leave the file intact', () => {
         const fileContent = fs.readFileSync(path.join(helper.scopes.localPath, 'bar/foo.js')).toString();
@@ -388,7 +389,7 @@ describe('bit checkout command', function () {
       describe('using manual strategy', () => {
         let output;
         before(() => {
-          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--manual');
+          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve manual');
         });
         it('should indicate that a new file was added', () => {
           expect(output).to.have.string(FileStatusWithoutChalk.added);
@@ -402,7 +403,7 @@ describe('bit checkout command', function () {
         let output;
         before(() => {
           helper.scopeHelper.getClonedLocalScope(scopeWithAddedFile);
-          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--theirs');
+          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve theirs');
         });
         it('should indicate that the new file was removed', () => {
           expect(output).to.have.string(FileStatusWithoutChalk.removed);
@@ -416,11 +417,10 @@ describe('bit checkout command', function () {
         let output;
         before(() => {
           helper.scopeHelper.getClonedLocalScope(scopeWithAddedFile);
-          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--ours');
+          output = helper.command.checkoutVersion('0.0.1', 'bar/foo', '--auto-merge-resolve ours');
         });
         it('should indicate that the new file was not changed', () => {
-          expect(output).to.have.string(FileStatusWithoutChalk.unchanged);
-          expect(output).to.have.string('foo2.js');
+          expect(output).to.not.have.string(FILE_CHANGES_CHECKOUT_MSG);
         });
         it('should not delete the file', () => {
           expect(path.join(helper.scopes.localPath, 'bar/foo2.js')).to.be.a.file();
@@ -488,15 +488,37 @@ describe('bit checkout command', function () {
       expect(comp.headVersion).to.equal(helper.command.getHead('comp1'));
     });
     it('bit checkout latest should checkout to the semver latest and not to the head snap', () => {
-      helper.command.checkout('latest');
+      helper.command.checkoutLatest();
       const bitMap = helper.bitMap.read();
       expect(bitMap.comp1.version).to.equal('0.0.2');
     });
     it('bit checkout head should checkout to the head snap and not to the semver latest', () => {
-      helper.command.checkout('head');
+      helper.command.checkoutHead();
       const bitMap = helper.bitMap.read();
       const head = helper.command.getHead('comp1');
       expect(bitMap.comp1.version).to.equal(head);
+    });
+  });
+  describe('checkout latest when there is no tag', () => {
+    let firstSnap: string;
+    let secondSnap: string;
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(1, false);
+      helper.command.snapAllComponentsWithoutBuild();
+      firstSnap = helper.command.getHead('comp1');
+      helper.command.export();
+      const afterFirstSnap = helper.scopeHelper.cloneLocalScope();
+      helper.command.snapAllComponentsWithoutBuild('--unmodified');
+      secondSnap = helper.command.getHead('comp1');
+      helper.command.export();
+      helper.scopeHelper.getClonedLocalScope(afterFirstSnap);
+      helper.command.checkoutLatest('-x');
+    });
+    it('should checkout to the head', () => {
+      const head = helper.command.getHead('comp1');
+      expect(head).to.equal(secondSnap);
+      expect(head).not.to.equal(firstSnap);
     });
   });
   describe('checkout to a version that does not exist locally', () => {

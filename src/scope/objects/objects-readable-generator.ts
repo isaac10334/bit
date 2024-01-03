@@ -1,8 +1,8 @@
 import pMapSeries from 'p-map-series';
+import { BitError } from '@teambit/bit-error';
 import { Readable } from 'stream';
 import { Ref, Repository } from '.';
 import { Scope } from '..';
-import ShowDoctorError from '../../error/show-doctor-error';
 import logger from '../../logger/logger';
 import { getAllVersionHashesMemoized } from '../component-ops/traverse-versions';
 import { HashMismatch } from '../exceptions';
@@ -21,7 +21,7 @@ export type ComponentWithCollectOptions = {
 export class ObjectsReadableGenerator {
   public readable: Readable;
   private pushed: string[] = [];
-  constructor(private repo: Repository) {
+  constructor(private repo: Repository, private callbackOnceDone: Function) {
     this.readable = new Readable({ objectMode: true, read() {} });
   }
   async pushObjectsToReadable(componentsWithOptions: ComponentWithCollectOptions[]) {
@@ -30,10 +30,9 @@ export class ObjectsReadableGenerator {
       await pMapSeries(componentsWithOptions, async (componentWithOptions) =>
         this.pushComponentObjects(componentWithOptions)
       );
-      logger.debug(`pushObjectsToReadable, pushed ${this.pushed.length} objects`);
-      this.readable.push(null);
+      this.closeReadableSuccessfully();
     } catch (err: any) {
-      this.readable.destroy(err);
+      this.closeReadableFailure(err);
     }
   }
 
@@ -45,9 +44,9 @@ export class ObjectsReadableGenerator {
           this.push({ ref: laneToFetch.hash(), buffer: laneBuffer });
         })
       );
-      this.readable.push(null);
+      this.closeReadableSuccessfully();
     } catch (err: any) {
-      this.readable.destroy(err);
+      this.closeReadableFailure(err);
     }
   }
 
@@ -57,10 +56,23 @@ export class ObjectsReadableGenerator {
         const objectItem = await this.getObjectGracefully(ref, scope);
         if (objectItem) this.push(objectItem);
       });
-      this.readable.push(null);
+      this.closeReadableSuccessfully();
     } catch (err: any) {
-      this.readable.destroy(err);
+      this.closeReadableFailure(err);
     }
+  }
+
+  private closeReadableSuccessfully() {
+    logger.debug(`ObjectsReadableGenerator, pushed ${this.pushed.length} objects`);
+    this.callbackOnceDone();
+    this.readable.push(null);
+  }
+
+  private closeReadableFailure(err: Error) {
+    logger.debug(`ObjectsReadableGenerator, pushed ${this.pushed.length} objects`);
+    logger.error(`ObjectsReadableGenerator, got an error`, err);
+    this.callbackOnceDone(err);
+    this.readable.destroy(err);
   }
 
   private async getObjectGracefully(ref: Ref, scope: Scope) {
@@ -96,8 +108,7 @@ export class ObjectsReadableGenerator {
     const { component, collectParents, collectArtifacts, collectParentsUntil, includeVersionHistory } =
       componentWithOptions;
     const version = await component.loadVersion(componentWithOptions.version, this.repo, false);
-    if (!version)
-      throw new ShowDoctorError(`failed loading version ${componentWithOptions.version} of ${component.id()}`);
+    if (!version) throw new BitError(`failed loading version ${componentWithOptions.version} of ${component.id()}`);
     if (collectParentsUntil && version.hash().isEqual(collectParentsUntil)) {
       return;
     }

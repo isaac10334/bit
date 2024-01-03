@@ -90,7 +90,7 @@ describe('bit remove command', function () {
     describe('with --remote flag', () => {
       let output;
       before(() => {
-        output = helper.command.removeComponent(`${helper.scopes.remote}/bar/foo --remote`);
+        output = helper.command.removeComponentFromRemote(`${helper.scopes.remote}/bar/foo`);
       });
       it('should show a successful message', () => {
         expect(output).to.have.string(`removed components from the remote scope: ${helper.scopes.remote}/bar/foo`);
@@ -110,13 +110,13 @@ describe('bit remove command', function () {
       helper.command.export();
     });
     it('should not remove component with dependencies when -f flag is false', () => {
-      const output = helper.command.removeComponent(`${helper.scopes.remote}/${componentName}`, '--remote');
+      const output = helper.command.removeComponentFromRemote(`${helper.scopes.remote}/${componentName}`);
       expect(output).to.have.string(
         `error: unable to delete ${helper.scopes.remote}/${componentName}, because the following components depend on it:`
       );
     });
     it('should remove component with dependencies when -f flag is true', () => {
-      const output = helper.command.removeComponent(`${helper.scopes.remote}/${componentName}`, '--remote -f');
+      const output = helper.command.removeComponentFromRemote(`${helper.scopes.remote}/${componentName}`, '-f');
       expect(output).to.have.string('removed components');
       expect(output).to.have.string(`${helper.scopes.remote}/${componentName}`);
     });
@@ -221,7 +221,7 @@ describe('bit remove command', function () {
       helper.command.tagWithoutBuild();
       helper.command.export();
 
-      helper.command.removeComponent('comp2', '--soft');
+      helper.command.softRemoveComponent('comp2');
       afterRemove = helper.scopeHelper.cloneLocalScope();
     });
     it('bit status should show a section of removed components', () => {
@@ -240,9 +240,7 @@ describe('bit remove command', function () {
       expect(list).to.have.lengthOf(1);
       expect(list[0].id).to.not.have.string('comp2');
     });
-    // @todo. not very easy to implement. coz before tag, when it's loaded from the workspace it fails and then
-    // it loads it from the scope. however, the removed data is not in the scope yet. only in the bitmap.
-    it.skip('bit show should show the component as removed', () => {
+    it('bit show should show the component as removed', () => {
       const removeData = helper.command.showAspectConfig('comp2', Extensions.remove);
       expect(removeData.config.removed).to.be.true;
     });
@@ -383,13 +381,104 @@ describe('bit remove command', function () {
       helper.scopeHelper.setNewLocalAndRemoteScopes();
       helper.fixtures.populateComponents(1, false);
       helper.command.snapAllComponentsWithoutBuild();
-      helper.command.removeComponent('comp1', '--soft');
+      helper.command.softRemoveComponent('comp1');
       helper.command.snapAllComponentsWithoutBuild('--ignore-issues="*"');
     });
     it('should show it as removed', () => {
       const removeAspect = helper.command.showAspectConfig('comp1', 'teambit.component/remove');
       expect(removeAspect).to.be.an('Object');
       expect(removeAspect.config.removed).to.be.true;
+    });
+  });
+  describe('remove when a lane is new', () => {
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(2);
+      helper.command.createLane();
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.removeComponent('comp1');
+    });
+    it('should remove the components from the local lane', () => {
+      const laneComps = helper.command.showOneLane('dev');
+      expect(laneComps).to.not.have.string('comp1');
+    });
+    it('should remove the components from the workspace', () => {
+      const list = helper.command.list();
+      expect(list).to.not.have.string('comp1');
+    });
+  });
+
+  describe('soft-remove then import', () => {
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.command.createLane();
+      helper.fixtures.populateComponents(2);
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.export();
+      helper.command.softRemoveOnLane('comp2');
+    });
+    it('should not throwing an error upon import', () => {
+      expect(() => helper.command.importComponent('comp2')).to.not.throw();
+    });
+  });
+
+  describe('soft remove on lane then tagging the dependent without removing the references to the removed component', () => {
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(2);
+      helper.command.tagAllComponents();
+      helper.command.export();
+
+      helper.command.softRemoveComponent('comp2');
+    });
+    it('bit status should show RemovedDependency issue', () => {
+      helper.command.expectStatusToHaveIssue(IssuesClasses.RemovedDependencies.name);
+    });
+  });
+
+  describe('soft remove on lane then tagging the dependent without removing the references to the removed component then recovering it', () => {
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(2);
+      helper.command.tagAllComponents();
+      helper.command.export();
+
+      helper.scopeHelper.reInitLocalScope();
+      helper.scopeHelper.addRemoteScope();
+      helper.command.importComponent('comp2', '-x');
+      helper.command.softRemoveComponent('comp2');
+      helper.command.tagWithoutBuild();
+      helper.command.export();
+
+      helper.scopeHelper.reInitLocalScope();
+      helper.scopeHelper.addRemoteScope();
+      helper.command.importManyComponents(['comp1', 'comp2'], '-x');
+      helper.command.recover('comp2');
+      helper.command.install();
+    });
+    it('bit status should not show RemovedDependency issue because it was recovered', () => {
+      helper.command.expectStatusToNotHaveIssue(IssuesClasses.RemovedDependencies.name);
+    });
+  });
+
+  describe('soft remove then snapping with --build', () => {
+    let snapOutput: string;
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(2);
+      helper.command.snapAllComponentsWithoutBuild();
+      helper.command.softRemoveComponent('comp1');
+      snapOutput = helper.command.snapAllComponents('--build');
+    });
+    it('should not build the removed component', () => {
+      expect(snapOutput).to.not.have.string('pipeline');
+      const versionObj = helper.command.catComponent('comp1@latest');
+      expect(versionObj.buildStatus).to.equal('pending');
+    });
+    it('should remove successfully', () => {
+      const versionObj = helper.command.catComponent('comp1@latest');
+      const removeExt = versionObj.extensions.find((ext) => ext.name === Extensions.remove);
+      expect(removeExt.config.removed).to.be.true;
     });
   });
 });

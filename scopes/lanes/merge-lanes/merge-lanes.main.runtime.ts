@@ -1,4 +1,5 @@
 import { BitError } from '@teambit/bit-error';
+import path from 'path';
 import { CLIAspect, CLIMain, MainRuntime } from '@teambit/cli';
 import ImporterAspect, { ImporterMain } from '@teambit/importer';
 import { LanesAspect, LanesMain } from '@teambit/lanes';
@@ -8,36 +9,44 @@ import MergingAspect, {
   ConfigMergeResult,
   ApplyVersionResults,
 } from '@teambit/merging';
-import WorkspaceAspect, { Workspace } from '@teambit/workspace';
-import chalk from 'chalk';
-import { BitId } from '@teambit/legacy-bit-id';
+import WorkspaceAspect, { OutsideWorkspaceError, Workspace } from '@teambit/workspace';
+import { getBasicLog } from '@teambit/snapping';
+import { ComponentID, ComponentIdList } from '@teambit/component-id';
+import { Log } from '@teambit/legacy/dist/scope/models/version';
 import pMapSeries from 'p-map-series';
+import { Scope as LegacyScope } from '@teambit/legacy/dist/scope';
 import { Consumer } from '@teambit/legacy/dist/consumer';
 import { MergeStrategy } from '@teambit/legacy/dist/consumer/versions-ops/merge-version';
-import { BitIds } from '@teambit/legacy/dist/bit-id';
 import { ScopeAspect, ScopeMain } from '@teambit/scope';
 import ScopeComponentsImporter from '@teambit/legacy/dist/scope/component-ops/scope-components-importer';
-import { ComponentID } from '@teambit/component-id';
 import { DEFAULT_LANE, LaneId } from '@teambit/lane-id';
 import { Lane, Version } from '@teambit/legacy/dist/scope/models';
 import { Logger, LoggerAspect, LoggerMain } from '@teambit/logger';
+import CheckoutAspect, { CheckoutMain, CheckoutProps, throwForFailures } from '@teambit/checkout';
 import { SnapsDistance } from '@teambit/legacy/dist/scope/component-ops/snaps-distance';
 import { RemoveAspect, RemoveMain } from '@teambit/remove';
-import { compact } from 'lodash';
+import { compact, uniq } from 'lodash';
 import { ExportAspect, ExportMain } from '@teambit/export';
-import { BitObject } from '@teambit/legacy/dist/scope/objects';
+import GlobalConfigAspect, { GlobalConfigMain } from '@teambit/global-config';
+import { BitObject, Ref } from '@teambit/legacy/dist/scope/objects';
 import { getDivergeData } from '@teambit/legacy/dist/scope/component-ops/get-diverge-data';
 import { MergeLanesAspect } from './merge-lanes.aspect';
 import { MergeLaneCmd } from './merge-lane.cmd';
 import { MergeLaneFromScopeCmd } from './merge-lane-from-scope.cmd';
+import { MissingCompsToMerge } from './exceptions/missing-comps-to-merge';
+import { MergeAbortLaneCmd, MergeAbortOpts } from './merge-abort.cmd';
+import { LastMerged } from './last-merged';
 
 export type MergeLaneOptions = {
   mergeStrategy: MergeStrategy;
+  ours?: boolean;
+  theirs?: boolean;
   noSnap: boolean;
   snapMessage: string;
   existingOnWorkspaceOnly: boolean;
   build: boolean;
   keepReadme: boolean;
+  squash?: boolean;
   noSquash: boolean;
   tag?: boolean;
   pattern?: string;
@@ -46,6 +55,7 @@ export type MergeLaneOptions = {
   resolveUnrelated?: MergeStrategy;
   ignoreConfigChanges?: boolean;
   skipFetch?: boolean;
+  excludeNonLaneComps?: boolean;
 };
 
 export class MergeLanesMain {
@@ -53,13 +63,15 @@ export class MergeLanesMain {
     private workspace: Workspace | undefined,
     private merging: MergingMain,
     private lanes: LanesMain,
-    private logger: Logger,
+    readonly logger: Logger,
     private remove: RemoveMain,
     private scope: ScopeMain,
     private exporter: ExportMain,
-    private importer: ImporterMain
+    private importer: ImporterMain,
+    private checkout: CheckoutMain
   ) {}
 
+  // eslint-disable-next-line complexity
   async mergeLane(
     laneName: string,
     options: MergeLaneOptions
@@ -77,6 +89,7 @@ export class MergeLanesMain {
       existingOnWorkspaceOnly,
       build,
       keepReadme,
+      squash,
       noSquash,
       pattern,
       includeDeps,
@@ -84,6 +97,7 @@ export class MergeLanesMain {
       resolveUnrelated,
       ignoreConfigChanges,
       skipFetch,
+      excludeNonLaneComps,
     } = options;
 
     const currentLaneId = consumer.getCurrentLaneId();
@@ -96,101 +110,127 @@ export class MergeLanesMain {
         `unable to merge lane "${otherLaneId.toString()}", you're already at this lane. to get updates, simply run "bit checkout head"`
       );
     }
+    if (resolveUnrelated && currentLaneId.isDefault()) {
+      throw new BitError(
+        `unable to resolve unrelated when on main. switch to ${otherLaneId.toString()} and run "bit lane merge main --resolve-unrelated"`
+      );
+    }
     const currentLane = currentLaneId.isDefault() ? null : await consumer.scope.loadLane(currentLaneId);
     const isDefaultLane = otherLaneId.isDefault();
-    const getOtherLane = async () => {
-      if (isDefaultLane) {
-        if (!skipFetch) {
-          await this.importer.importObjectsFromMainIfExist(currentLane?.toBitIds().toVersionLatest() || []);
-        }
-        return undefined;
+    if (isDefaultLane) {
+      if (!skipFetch) {
+        const ids = await this.getMainIdsToMerge(currentLane, !excludeNonLaneComps);
+        const compIdList = ComponentIdList.fromArray(ids).toVersionLatest();
+        await this.importer.importObjectsFromMainIfExist(compIdList);
       }
+    }
+    let laneToFetchArtifactsFrom: Lane | undefined;
+    const getOtherLane = async () => {
       let lane = await consumer.scope.loadLane(otherLaneId);
       const shouldFetch = !lane || (!skipFetch && !lane.isNew);
       if (shouldFetch) {
         // don't assign `lane` to the result of this command. otherwise, if you have local snaps, it'll ignore them and use the remote-lane.
         const otherLane = await this.lanes.fetchLaneWithItsComponents(otherLaneId);
-
-        await this.importer.importHeadArtifactsFromLane(otherLane, true);
-
+        laneToFetchArtifactsFrom = otherLane;
         lane = await consumer.scope.loadLane(otherLaneId);
       }
       return lane;
     };
-    const otherLane = await getOtherLane();
+    const otherLane = isDefaultLane ? undefined : await getOtherLane();
     const getBitIds = async () => {
       if (isDefaultLane) {
-        if (!currentLane) throw new Error(`unable to merge ${DEFAULT_LANE}, the current lane was not found`);
-        return this.getMainIdsToMerge(currentLane);
+        const ids = await this.getMainIdsToMerge(currentLane, !excludeNonLaneComps);
+        const modelComponents = await Promise.all(ids.map((id) => this.scope.legacyScope.getModelComponent(id)));
+        return compact(
+          modelComponents.map((c) => {
+            if (!c.head) return null; // probably the component was never merged to main
+            return c.toComponentId().changeVersion(c.head.toString());
+          })
+        );
       }
       if (!otherLane) throw new Error(`lane must be defined for non-default`);
       return otherLane.toBitIds();
     };
-    const bitIds = await getBitIds();
-    this.logger.debug(`merging the following bitIds: ${bitIds.toString()}`);
+    const idsToMerge = await getBitIds();
+    this.logger.debug(`merging the following ids: ${idsToMerge.toString()}`);
 
-    let allComponentsStatus = await this.merging.getMergeStatus(bitIds, currentLane, otherLane, {
+    const shouldSquash = squash || (currentLaneId.isDefault() && !noSquash);
+    let allComponentsStatus = await this.merging.getMergeStatus(idsToMerge, currentLane, otherLane, {
       resolveUnrelated,
       ignoreConfigChanges,
+      shouldSquash,
     });
-    const shouldSquash = currentLaneId.isDefault() && !noSquash;
 
     if (pattern) {
-      const componentIds = await this.workspace.resolveMultipleComponentIds(bitIds);
-      const compIdsFromPattern = this.workspace.scope.filterIdsFromPoolIdsByPattern(pattern, componentIds);
+      const componentIds = await this.workspace.resolveMultipleComponentIds(idsToMerge);
+      const compIdsFromPattern = await this.workspace.filterIdsFromPoolIdsByPattern(pattern, componentIds);
       allComponentsStatus = await filterComponentsStatus(
         allComponentsStatus,
         compIdsFromPattern,
-        bitIds,
+        idsToMerge,
         this.workspace,
         includeDeps,
         otherLane || undefined,
         shouldSquash
       );
-      bitIds.forEach((bitId) => {
+      idsToMerge.forEach((bitId) => {
         if (!allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(bitId))) {
-          allComponentsStatus.push({ id: bitId, unmergedLegitimately: true, unmergedMessage: `excluded by pattern` });
+          allComponentsStatus.push({ id: bitId, unchangedLegitimately: true, unchangedMessage: `excluded by pattern` });
         }
       });
     }
     if (existingOnWorkspaceOnly) {
       const workspaceIds = await this.workspace.listIds();
       const compIdsFromPattern = workspaceIds.filter((id) =>
-        allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(id._legacy))
+        allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(id))
       );
       allComponentsStatus = await filterComponentsStatus(
         allComponentsStatus,
         compIdsFromPattern,
-        bitIds,
+        idsToMerge,
         this.workspace,
         includeDeps,
         otherLane || undefined,
         shouldSquash
       );
-      bitIds.forEach((bitId) => {
+      idsToMerge.forEach((bitId) => {
         if (!allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(bitId))) {
-          allComponentsStatus.push({ id: bitId, unmergedLegitimately: true, unmergedMessage: `not in the workspace` });
+          allComponentsStatus.push({
+            id: bitId,
+            unchangedLegitimately: true,
+            unchangedMessage: `not in the workspace`,
+          });
         }
       });
     }
 
-    throwForFailures();
+    throwForFailures(allComponentsStatus);
 
     if (shouldSquash) {
       await squashSnaps(allComponentsStatus, otherLaneId, consumer);
     }
 
+    if (laneToFetchArtifactsFrom) {
+      const ids = allComponentsStatus.map((c) => c.id);
+      await this.importer.importHeadArtifactsFromLane(laneToFetchArtifactsFrom, ids, true);
+    }
+
+    const lastMerged = new LastMerged(this.scope, consumer, this.logger);
+    const snapshot = await lastMerged.takeSnapshot(currentLane);
+
     const mergeResults = await this.merging.mergeSnaps({
       mergeStrategy,
       allComponentsStatus,
-      laneId: otherLaneId,
-      localLane: currentLane,
+      otherLaneId,
+      currentLane,
       noSnap,
       tag,
       snapMessage,
       build,
       skipDependencyInstallation,
     });
+
+    await lastMerged.persistSnapshot(snapshot);
 
     const mergedSuccessfully =
       !mergeResults.failedComponents ||
@@ -200,56 +240,72 @@ export class MergeLanesMain {
     let deleteResults = {};
 
     if (!keepReadme && otherLane && otherLane.readmeComponent && mergedSuccessfully) {
-      const readmeComponentId = otherLane.readmeComponent.id
-        .changeVersion(otherLane.readmeComponent?.head?.hash)
-        .toString();
-
-      deleteResults = await this.remove.remove({
-        componentsPattern: readmeComponentId,
-        force: false,
-        remote: false,
-        track: false,
-        deleteFiles: true,
-        fromLane: false,
-      });
+      const readmeComponentId = otherLane.readmeComponent.id.changeVersion(otherLane.readmeComponent?.head?.hash);
+      deleteResults = await this.remove.removeLocallyByIds([readmeComponentId]);
     } else if (otherLane && !otherLane.readmeComponent) {
-      deleteResults = { readmeResult: `\nlane ${otherLane.name} doesn't have a readme component` };
+      deleteResults = { readmeResult: '' };
     }
     const configMergeResults = allComponentsStatus.map((c) => c.configMergeResult);
 
-    await this.workspace.consumer.onDestroy();
+    await this.workspace.consumer.onDestroy(`lane-merge (${otherLaneId.name})`);
 
     return { mergeResults, deleteResults, configMergeResults: compact(configMergeResults) };
-
-    function throwForFailures() {
-      const failedComponents = allComponentsStatus.filter((c) => c.unmergedMessage && !c.unmergedLegitimately);
-      if (failedComponents.length) {
-        const failureMsgs = failedComponents
-          .map(
-            (failedComponent) =>
-              `${chalk.bold(failedComponent.id.toString())} - ${chalk.red(failedComponent.unmergedMessage as string)}`
-          )
-          .join('\n');
-        throw new BitError(`unable to merge due to the following failures:\n${failureMsgs}`);
-      }
-    }
   }
 
-  private async getMainIdsToMerge(lane: Lane) {
-    const laneIds = lane.toBitIds();
-    if (!this.workspace) {
-      throw new BitError(`getMainIdsToMerge needs workspace`);
+  async abortLaneMerge(checkoutProps: CheckoutProps, mergeAbortOpts: MergeAbortOpts) {
+    if (!this.workspace) throw new OutsideWorkspaceError();
+    const lastMerge = new LastMerged(this.scope, this.workspace.consumer, this.logger);
+    const currentLane = await this.lanes.getCurrentLane();
+    const { compDirsToRemove } = await lastMerge.restoreFromLastMerged(mergeAbortOpts, currentLane);
+
+    await this.workspace._reloadConsumer();
+
+    this.workspace.consumer.scope.objects.unmergedComponents.removeAllComponents();
+    await this.workspace.consumer.scope.objects.unmergedComponents.write();
+
+    const configMergeFile = this.workspace.getConflictMergeFile();
+    await configMergeFile.delete();
+
+    let checkoutResults: ApplyVersionResults | undefined;
+    let checkoutError: Error | undefined;
+    checkoutProps.ids = await this.workspace.listIds();
+    checkoutProps.restoreMissingComponents = true;
+    try {
+      checkoutResults = await this.checkout.checkout(checkoutProps);
+    } catch (err: any) {
+      this.logger.error(`merge-abort got an error during the checkout stage`, err);
+      checkoutError = err;
     }
-    const workspaceIds = (await this.workspace.listIds()).map((id) => id._legacy);
-    const mainNotOnLane = workspaceIds.filter((id) => !laneIds.find((laneId) => laneId.isEqualWithoutVersion(id)));
-    const ids = [...laneIds, ...mainNotOnLane].filter((id) => id.hasScope());
-    const modelComponents = await Promise.all(ids.map((id) => this.scope.legacyScope.getModelComponent(id)));
-    return compact(
-      modelComponents.map((c) => {
-        if (!c.head) return null; // probably the component was never merged to main
-        return c.toBitId().changeVersion(c.head.toString());
-      })
-    );
+
+    const restoredItems = [
+      `${path.basename(this.workspace.consumer.bitMap.mapPath)} file`,
+      `${path.basename(this.workspace.consumer.config.path)} file`,
+    ];
+    if (compDirsToRemove.length) {
+      restoredItems.push(`deleted components directories: ${compDirsToRemove.join(', ')}`);
+    }
+    if (currentLane) {
+      restoredItems.push(`${currentLane.id()} lane object`);
+    }
+
+    return { checkoutResults, restoredItems, checkoutError };
+  }
+
+  private async getMainIdsToMerge(lane?: Lane | null, includeNonLaneComps = true) {
+    if (!lane) throw new Error(`unable to merge ${DEFAULT_LANE}, the current lane was not found`);
+    const laneIds = lane.toBitIds();
+    const ids = laneIds.filter((id) => this.scope.isExported(id));
+    if (includeNonLaneComps) {
+      if (!this.workspace) {
+        throw new BitError(`getMainIdsToMerge needs workspace`);
+      }
+      const workspaceIds = await this.workspace.listIds();
+      const mainNotOnLane = workspaceIds.filter(
+        (id) => !laneIds.find((laneId) => laneId.isEqualWithoutVersion(id)) && this.scope.isExported(id)
+      );
+      ids.push(...mainNotOnLane);
+    }
+    return ids;
   }
 
   async mergeFromScope(
@@ -271,36 +327,40 @@ export class MergeLanesMain {
     const toLaneId = toLane === DEFAULT_LANE ? this.lanes.getDefaultLaneId() : LaneId.parse(toLane);
     const toLaneObj = toLaneId.isDefault() ? undefined : await this.lanes.importLaneObject(toLaneId);
     const fromLaneBitIds = fromLaneObj.toBitIds();
-    const getIdsToMerge = async (): Promise<BitIds> => {
+    const getIdsToMerge = async (): Promise<ComponentIdList> => {
       if (!options.pattern) return fromLaneBitIds;
       const laneCompIds = await this.scope.resolveMultipleComponentIds(fromLaneBitIds);
-      const ids = this.scope.filterIdsFromPoolIdsByPattern(options.pattern, laneCompIds);
-      return BitIds.fromArray(ids.map((id) => id._legacy));
+      const ids = await this.scope.filterIdsFromPoolIdsByPattern(options.pattern, laneCompIds);
+      return ComponentIdList.fromArray(ids.map((id) => id));
     };
     const idsToMerge = await getIdsToMerge();
     const scopeComponentsImporter = ScopeComponentsImporter.getInstance(this.scope.legacyScope);
-    await scopeComponentsImporter.importManyDeltaWithoutDeps({
-      ids: idsToMerge,
-      fromHead: true,
+    await scopeComponentsImporter.importWithoutDeps(idsToMerge.toVersionLatest(), {
+      cache: false,
       lane: fromLaneObj,
       ignoreMissingHead: true,
+      includeVersionHistory: true,
+      reason: `of "from" lane (${fromLaneId.name}) for lane-merge to get all version-history`,
     });
+
     // get their main/to-lane as well
-    await scopeComponentsImporter.importManyDeltaWithoutDeps({
-      ids: idsToMerge.toVersionLatest(),
-      fromHead: true,
-      ignoreMissingHead: true,
+    await scopeComponentsImporter.importWithoutDeps(idsToMerge.toVersionLatest(), {
+      cache: false,
       lane: toLaneObj,
+      ignoreMissingHead: true,
+      includeVersionHistory: true,
+      reason: `of "to" lane (${toLaneId.name}) for lane-merge to get all version-history`,
     });
-    await this.importer.importHeadArtifactsFromLane(fromLaneObj, true);
+    await this.importer.importHeadArtifactsFromLane(fromLaneObj, undefined, true);
     await this.throwIfNotUpToDate(fromLaneId, toLaneId);
     const repo = this.scope.legacyScope.objects;
     // loop through all components, make sure they're all ahead of main (it might not be on main yet).
     // then, change the version object to include an extra parent to point to the main.
     // then, change the component object head to point to this changed version
-    const mergedPreviously: BitId[] = [];
-    const mergedNow: BitId[] = [];
+    const mergedPreviously: ComponentID[] = [];
+    const mergedNow: ComponentID[] = [];
     const shouldSquash = !toLaneObj && !options.noSquash; // only when merging to main we squash.
+    const log = await getLogForSquash(fromLaneId);
     const bitObjectsPerComp = await pMapSeries(idsToMerge, async (id) => {
       const modelComponent = await this.scope.legacyScope.getModelComponent(id);
       const fromVersionObj = await modelComponent.loadVersion(id.version as string, repo);
@@ -312,17 +372,25 @@ export class MergeLanesMain {
         mergedPreviously.push(id);
         return undefined;
       }
-      // this might be confusing, we pass the toLaneHead as the sourceHead and the fromLaneHead as the targetHead.
-      // this is because normally, in the workspace, we merge another lane (target) into the current lane (source).
-      // so effectively, in the workspace, we merge fromLane=target into toLane=source.
+
       const divergeData = await getDivergeData({
         repo,
         modelComponent,
         sourceHead: toLaneHead,
         targetHead: fromLaneHead,
+        throwForNoCommonSnap: true,
       });
       const modifiedVersion = shouldSquash
-        ? squashOneComp(DEFAULT_LANE, fromLaneId, id, divergeData, fromVersionObj)
+        ? await squashOneComp(
+            DEFAULT_LANE,
+            fromLaneId,
+            id,
+            divergeData,
+            log,
+            this.scope.legacyScope,
+            fromVersionObj,
+            options.snapMessage
+          )
         : undefined;
       const objects: BitObject[] = [];
       if (modifiedVersion) objects.push(modifiedVersion);
@@ -342,11 +410,11 @@ export class MergeLanesMain {
     let exportedIds: string[] = [];
     if (options.push) {
       const ids = compact(bitObjectsPerComp).map((b) => b.id);
-      const bitIds = BitIds.fromArray(ids);
+      const bitIds = ComponentIdList.fromArray(ids);
       const { exported } = await this.exporter.exportMany({
         scope: this.scope.legacyScope,
-        ids: shouldSquash ? bitIds : new BitIds(),
-        idsWithFutureScope: shouldSquash ? bitIds : new BitIds(),
+        ids: shouldSquash ? bitIds : new ComponentIdList(),
+        idsWithFutureScope: shouldSquash ? bitIds : new ComponentIdList(),
         laneObject: toLaneObj,
         allVersions: false,
         // no need to export anything else other than the head. the normal calculation of what to export won't apply here
@@ -355,6 +423,7 @@ export class MergeLanesMain {
         // all artifacts must be pushed. they're all considered "external" in this case, because it's running from a
         // bare-scope, but we don't want to ignore them, otherwise, they'll be missing from the component-scopes.
         ignoreMissingExternalArtifacts: false,
+        exportOrigin: 'lane-merge',
       });
       exportedIds = exported.map((id) => id.toString());
     }
@@ -385,10 +454,24 @@ ${compsNotUpToDate.map((s) => s.componentId.toString()).join('\n')}`);
     ScopeAspect,
     ExportAspect,
     ImporterAspect,
+    CheckoutAspect,
+    GlobalConfigAspect,
   ];
   static runtime = MainRuntime;
 
-  static async provider([lanes, cli, workspace, merging, loggerMain, remove, scope, exporter, importer]: [
+  static async provider([
+    lanes,
+    cli,
+    workspace,
+    merging,
+    loggerMain,
+    remove,
+    scope,
+    exporter,
+    importer,
+    checkout,
+    globalConfig,
+  ]: [
     LanesMain,
     CLIMain,
     Workspace,
@@ -397,12 +480,25 @@ ${compsNotUpToDate.map((s) => s.componentId.toString()).join('\n')}`);
     RemoveMain,
     ScopeMain,
     ExportMain,
-    ImporterMain
+    ImporterMain,
+    CheckoutMain,
+    GlobalConfigMain
   ]) {
     const logger = loggerMain.createLogger(MergeLanesAspect.id);
     const lanesCommand = cli.getCommand('lane');
-    const mergeLanesMain = new MergeLanesMain(workspace, merging, lanes, logger, remove, scope, exporter, importer);
-    lanesCommand?.commands?.push(new MergeLaneCmd(mergeLanesMain));
+    const mergeLanesMain = new MergeLanesMain(
+      workspace,
+      merging,
+      lanes,
+      logger,
+      remove,
+      scope,
+      exporter,
+      importer,
+      checkout
+    );
+    lanesCommand?.commands?.push(new MergeLaneCmd(mergeLanesMain, globalConfig));
+    lanesCommand?.commands?.push(new MergeAbortLaneCmd(mergeLanesMain));
     cli.register(new MergeLaneFromScopeCmd(mergeLanesMain));
     return mergeLanesMain;
   }
@@ -411,47 +507,65 @@ ${compsNotUpToDate.map((s) => s.componentId.toString()).join('\n')}`);
 async function filterComponentsStatus(
   allComponentsStatus: ComponentMergeStatus[],
   compIdsToKeep: ComponentID[],
-  allBitIds: BitId[],
+  allBitIds: ComponentID[],
   workspace: Workspace,
   includeDeps = false,
   otherLane?: Lane, // lane that gets merged into the current lane. if not provided, it's main that gets merged into the current lane
   shouldSquash?: boolean
 ): Promise<ComponentMergeStatus[]> {
-  const bitIdsFromPattern = BitIds.fromArray(compIdsToKeep.map((c) => c._legacy));
+  const bitIdsFromPattern = ComponentIdList.fromArray(compIdsToKeep);
   const bitIdsNotFromPattern = allBitIds.filter((bitId) => !bitIdsFromPattern.hasWithoutVersion(bitId));
   const filteredComponentStatus: ComponentMergeStatus[] = [];
-  const depsToAdd: BitId[] = [];
-  await pMapSeries(compIdsToKeep, async (compId) => {
-    const fromStatus = allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(compId._legacy));
+  const depsToAdd: ComponentID[] = [];
+  const missingDepsFromHead = {};
+  const missingDepsFromHistory: string[] = [];
+
+  const versionsToCheckPerId = await pMapSeries(compIdsToKeep, async (compId) => {
+    const fromStatus = allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(compId));
     if (!fromStatus) {
       throw new Error(`filterComponentsStatus: unable to find ${compId.toString()} in component-status`);
     }
     filteredComponentStatus.push(fromStatus);
-    if (fromStatus.unmergedMessage) {
-      return;
+    if (fromStatus.unchangedMessage) {
+      return undefined;
     }
     if (!otherLane) {
       // if merging main, no need to check whether the deps are included in the pattern.
-      return;
+      return undefined;
     }
     const { divergeData } = fromStatus;
     if (!divergeData) {
       throw new Error(`filterComponentsStatus: unable to find divergeData for ${compId.toString()}`);
     }
-    let targetVersions = divergeData.snapsOnTargetOnly;
+    let targetVersions: Ref[] = divergeData.snapsOnTargetOnly;
     if (!targetVersions.length) {
-      return;
+      return undefined;
     }
-    const modelComponent = await workspace.consumer.scope.getModelComponent(compId._legacy);
+    const modelComponent = await workspace.consumer.scope.getModelComponent(compId);
     if (shouldSquash) {
       // no need to check all versions, we merge only the head
-      const headOnTarget = otherLane ? otherLane.getComponent(compId._legacy)?.head : modelComponent.head;
+      const headOnTarget = otherLane ? otherLane.getComponent(compId)?.head : modelComponent.head;
       if (!headOnTarget) {
         throw new Error(`filterComponentsStatus: unable to find head for ${compId.toString()}`);
       }
       targetVersions = [headOnTarget];
     }
 
+    return { compId, targetVersions, modelComponent };
+  });
+
+  // all these versions needs to be imported to load them later and check whether they have dependencies on the target lane
+  const toImport = compact(versionsToCheckPerId)
+    .map((c) => c.targetVersions.map((v) => c.compId.changeVersion(v.toString())))
+    .flat();
+  await workspace.consumer.scope.scopeImporter.importWithoutDeps(ComponentIdList.fromArray(toImport), {
+    lane: otherLane,
+    cache: true,
+    includeVersionHistory: false,
+    reason: 'import all history of given patterns components to check whether they have dependencies on the lane',
+  });
+
+  await pMapSeries(compact(versionsToCheckPerId), async ({ compId, targetVersions, modelComponent }) => {
     await pMapSeries(targetVersions, async (remoteVersion) => {
       const versionObj = await modelComponent.loadVersion(remoteVersion.toString(), workspace.consumer.scope.objects);
       const flattenedDeps = versionObj.getAllFlattenedDependencies();
@@ -461,7 +575,7 @@ async function filterComponentsStatus(
       if (!depsNotIncludeInPattern.length) {
         return;
       }
-      const depsOnLane: BitId[] = [];
+      const depsOnLane: ComponentID[] = [];
       await Promise.all(
         depsNotIncludeInPattern.map(async (dep) => {
           const isOnLane = await workspace.consumer.scope.isIdOnLane(dep, otherLane);
@@ -473,17 +587,30 @@ async function filterComponentsStatus(
       if (!depsOnLane.length) {
         return;
       }
-      if (!includeDeps) {
-        throw new BitError(`unable to merge ${compId.toString()}.
-it has (in version ${remoteVersion.toString()}) the following dependencies which were not included in the pattern. consider adding "--include-deps" flag
-${depsOnLane.map((d) => d.toString()).join('\n')}`);
+      if (includeDeps) {
+        depsToAdd.push(...depsOnLane);
+      } else {
+        const headOnTarget = otherLane ? otherLane.getComponent(compId)?.head : modelComponent.head;
+        const depsOnLaneStr = depsOnLane.map((dep) => dep.toStringWithoutVersion());
+        if (headOnTarget?.isEqual(remoteVersion)) {
+          depsOnLaneStr.forEach((dep) => {
+            (missingDepsFromHead[dep] ||= []).push(compId.toStringWithoutVersion());
+          });
+        } else {
+          missingDepsFromHistory.push(...depsOnLaneStr);
+        }
       }
-      depsToAdd.push(...depsOnLane);
     });
   });
+  if (Object.keys(missingDepsFromHead).length || missingDepsFromHistory.length) {
+    throw new MissingCompsToMerge(missingDepsFromHead, uniq(missingDepsFromHistory));
+  }
+
   if (depsToAdd.length) {
-    const depsUniq = BitIds.uniqFromArray(depsToAdd);
-    depsUniq.forEach((id) => {
+    // remove the version, otherwise, the uniq gives duplicate components with different versions.
+    const depsWithoutVersion = depsToAdd.map((d) => d.changeVersion(undefined));
+    const depsUniqWithoutVersion = ComponentIdList.uniqFromArray(depsWithoutVersion);
+    depsUniqWithoutVersion.forEach((id) => {
       const fromStatus = allComponentsStatus.find((c) => c.id.isEqualWithoutVersion(id));
       if (!fromStatus) {
         throw new Error(`filterComponentsStatus: unable to find ${id.toString()} in component-status`);
@@ -494,15 +621,35 @@ ${depsOnLane.map((d) => d.toString()).join('\n')}`);
   return filteredComponentStatus;
 }
 
+async function getLogForSquash(otherLaneId: LaneId) {
+  const basicLog = await getBasicLog();
+  const log = {
+    ...basicLog,
+    message: `squashed during merge from ${otherLaneId.toString()}`,
+  };
+  return log;
+}
+
 async function squashSnaps(allComponentsStatus: ComponentMergeStatus[], otherLaneId: LaneId, consumer: Consumer) {
   const currentLaneName = consumer.getCurrentLaneId().name;
-  const succeededComponents = allComponentsStatus.filter((c) => !c.unmergedMessage);
+  const succeededComponents = allComponentsStatus.filter((c) => !c.unchangedMessage);
+  const log = await getLogForSquash(otherLaneId);
+
   await Promise.all(
     succeededComponents.map(async ({ id, divergeData, componentFromModel }) => {
       if (!divergeData) {
         throw new Error(`unable to squash. divergeData is missing from ${id.toString()}`);
       }
-      const modifiedComp = squashOneComp(currentLaneName, otherLaneId, id, divergeData, componentFromModel);
+
+      const modifiedComp = await squashOneComp(
+        currentLaneName,
+        otherLaneId,
+        id,
+        divergeData,
+        log,
+        consumer.scope,
+        componentFromModel
+      );
       if (modifiedComp) {
         consumer.scope.objects.add(modifiedComp);
         const modelComponent = await consumer.scope.getModelComponent(id);
@@ -516,13 +663,16 @@ async function squashSnaps(allComponentsStatus: ComponentMergeStatus[], otherLan
 /**
  * returns Version object if it was modified. otherwise, returns undefined
  */
-function squashOneComp(
+async function squashOneComp(
   currentLaneName: string,
   otherLaneId: LaneId,
-  id: BitId,
+  id: ComponentID,
   divergeData: SnapsDistance,
-  componentFromModel?: Version
-): Version | undefined {
+  log: Log,
+  scope: LegacyScope,
+  componentFromModel?: Version,
+  messageTitle?: string
+): Promise<Version | undefined> {
   if (divergeData.isDiverged()) {
     throw new BitError(`unable to squash because ${id.toString()} is diverged in history.
 consider switching to "${
@@ -545,26 +695,53 @@ alternatively, use "--no-squash" flag to keep the entire history of "${otherLane
   if (remoteSnaps.length === 0) {
     throw new Error(`remote is ahead but it has no snaps. it's impossible`);
   }
-  // no need to check this case. even if it has only one snap ahead, we want to do the "squash", and run "addAsOnlyParent"
-  // to make sure it doesn't not have two parents.
-  // if (remoteSnaps.length === 1) {
-  //   // nothing to squash. it has only one commit.
-  //   return;
-  // }
+  const getAllMessages = async () => {
+    if (!messageTitle) return [];
+    await scope.scopeImporter.importManyObjects({ [otherLaneId.scope]: remoteSnaps.map((s) => s.toString()) });
+    const versionObjects = (await Promise.all(remoteSnaps.map((s) => scope.objects.load(s)))) as Version[];
+    return compact(versionObjects).map((v) => v.log.message);
+  };
+  const getFinalMessage = async (): Promise<string | undefined> => {
+    if (!messageTitle) return undefined;
+    const allMessage = await getAllMessages();
+    const allMessageStr = compact(allMessage)
+      .map((m) => `[*] ${m}`)
+      .join('\n');
+    return `${messageTitle}\n${allMessageStr}`;
+  };
   if (!componentFromModel) {
     throw new Error('unable to squash, the componentFromModel is missing');
   }
-
   const currentParents = componentFromModel.parents;
 
-  // do the squash.
-  if (divergeData.commonSnapBeforeDiverge) {
-    componentFromModel.addAsOnlyParent(divergeData.commonSnapBeforeDiverge);
-  } else {
+  // if the remote has only one snap, there is nothing to squash.
+  // other checks here is to make sure `componentFromModel.addAsOnlyParent` call is not needed.
+  if (remoteSnaps.length === 1 && divergeData.commonSnapBeforeDiverge && currentParents.length === 1) {
+    return undefined;
+  }
+
+  const doSquash = async () => {
+    if (divergeData.commonSnapBeforeDiverge) {
+      componentFromModel.addAsOnlyParent(divergeData.commonSnapBeforeDiverge);
+      return;
+    }
+    if (currentLaneName !== DEFAULT_LANE) {
+      // when squashing into lane, we have to take main into account
+      const modelComponent = await scope.getModelComponentIfExist(id);
+      if (!modelComponent) throw new Error(`missing ModelComponent for ${id.toString()}`);
+      if (modelComponent.head) {
+        componentFromModel.addAsOnlyParent(modelComponent.head);
+        return;
+      }
+    }
     // there is no commonSnapBeforeDiverge. the local has no snaps, all are remote, no need for parents. keep only head.
     componentFromModel.parents.forEach((ref) => componentFromModel.removeParent(ref));
-  }
-  componentFromModel.setSquashed({ previousParents: currentParents, laneId: otherLaneId });
+  };
+
+  await doSquash();
+
+  const finalMessage = await getFinalMessage();
+  componentFromModel.setSquashed({ previousParents: currentParents, laneId: otherLaneId }, log, finalMessage);
   return componentFromModel;
 }
 

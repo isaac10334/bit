@@ -60,9 +60,9 @@ describe('bit lane command', function () {
         before(() => {
           helper.command.switchLocalLane('main');
         });
-        it('bit list should not show the component', () => {
+        it('bit list should show the component, because it has head', () => {
           const list = helper.command.listParsed();
-          expect(list).to.have.lengthOf(0);
+          expect(list).to.have.lengthOf(1);
         });
       });
     });
@@ -83,8 +83,8 @@ describe('bit lane command', function () {
       helper.command.export();
 
       helper.fs.outputFile('bar2/foo2.js', 'console.log("v1");');
-      helper.command.addComponent('bar2');
       helper.bitJsonc.addToVariant('bar2', 'defaultScope', anotherRemote);
+      helper.command.addComponent('bar2');
       helper.command.compile();
       helper.command.createLane();
       helper.command.snapAllComponentsWithoutBuild();
@@ -158,7 +158,7 @@ describe('bit lane command', function () {
       before(() => {
         helper.scopeHelper.setNewLocalAndRemoteScopes();
         helper.command.createLane();
-        helper.command.create('aspect', 'my-aspect');
+        helper.command.create('bit-aspect', 'my-aspect');
         helper.fixtures.populateComponents();
         helper.fs.outputFile(
           `${helper.scopes.remote}/my-aspect/foo.ts`,
@@ -260,6 +260,28 @@ describe('bit lane command', function () {
       expect(helper.command.getHeadOfLane('lane-a', 'comp1')).to.equal(secondSnapLaneA, 'lane-a was not updated');
       expect(helper.command.getHeadOfLane('lane-b', 'comp1')).to.equal(secondSnapLaneB, 'lane-b was not updated');
       expect(helper.command.getHead('comp1')).to.equal(secondSnapMain, 'main was not updated');
+    });
+  });
+  describe('import previous version from main when on a lane', () => {
+    before(() => {
+      helper.scopeHelper.setNewLocalAndRemoteScopes();
+      helper.fixtures.populateComponents(1, false);
+      helper.command.tagAllWithoutBuild();
+      helper.command.tagAllWithoutBuild('--unmodified');
+      helper.command.export();
+
+      helper.scopeHelper.reInitLocalScope();
+      helper.scopeHelper.addRemoteScope();
+      helper.command.createLane();
+      helper.command.importComponent('comp1@0.0.1');
+      helper.command.snapAllComponentsWithoutBuild('--unmodified');
+    });
+    // previous bug showed this component in the pending-updates section.
+    // it was because the calculation whether it's up-to-date was based also on the component-head.
+    // it should be based on the remote-lane object only.
+    it('bit status should not show the component as pending-updates because it does not exits on the remote lane', () => {
+      const status = helper.command.statusJson();
+      expect(status.outdatedComponents).to.have.lengthOf(0);
     });
   });
 });

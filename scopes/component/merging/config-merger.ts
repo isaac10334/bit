@@ -1,10 +1,10 @@
 import { ComponentID } from '@teambit/component-id';
 import semver from 'semver';
 import { Logger } from '@teambit/logger';
+import BuilderAspect from '@teambit/builder';
 import { isHash } from '@teambit/component-version';
 import {
   DependencyResolverAspect,
-  isRange,
   SerializedDependency,
   VariantPolicy,
   VariantPolicyEntry,
@@ -68,7 +68,7 @@ export class ConfigMerger {
   private currentEnv: EnvData;
   private otherEnv: EnvData;
   private baseEnv?: EnvData;
-  private handledExtIds: string[] = [];
+  private handledExtIds: string[] = [BuilderAspect.id]; // don't try to merge builder, it's possible that at one end it wasn't built yet, so it's empty
   private otherLaneIdsStr: string[];
   constructor(
     private compIdStr: string,
@@ -81,11 +81,13 @@ export class ConfigMerger {
     private otherLabel: string,
     private logger: Logger
   ) {
-    this.otherLaneIdsStr = otherLane?.components.map((c) => c.id.toStringWithoutVersion()) || [];
+    this.otherLaneIdsStr = otherLane?.toBitIds().map((id) => id.toString()) || [];
   }
 
   merge(): ConfigMergeResult {
-    this.logger.trace(`************** start config-merger for ${this.compIdStr} **************`);
+    this.logger.debug(`\n************** start config-merger for ${this.compIdStr} **************`);
+    this.logger.debug(`currentLabel: ${this.currentLabel}`);
+    this.logger.debug(`otherLabel: ${this.otherLabel}`);
     this.populateEnvs();
     const results = this.currentAspects.map((currentExt) => {
       const id = currentExt.stringId;
@@ -127,7 +129,7 @@ export class ConfigMerger {
       return { id, mergedConfig: this.getConfig(otherExt) };
     });
     const envResult = [this.envStrategy()] || [];
-    this.logger.trace(`*** end config-merger for ${this.compIdStr} ***\n`);
+    this.logger.debug(`*** end config-merger for ${this.compIdStr} ***\n`);
     return new ConfigMergeResult(
       this.compIdStr,
       this.currentLabel,
@@ -191,7 +193,7 @@ export class ConfigMerger {
     if (this.currentEnv.id === this.otherEnv.id && this.currentEnv.version === this.otherEnv.version) {
       return null;
     }
-    if (this.isIdInWorkspace(this.currentEnv.id)) {
+    if (this.isIdInWorkspaceOrOtherLane(this.currentEnv.id, this.otherEnv.version)) {
       // the env currently used is part of the workspace, that's what the user needs. don't try to resolve anything.
       return null;
     }
@@ -236,16 +238,20 @@ export class ConfigMerger {
 
   private depResolverStrategy(params: MergeStrategyParams): MergeStrategyResult | undefined {
     if (params.id !== DependencyResolverAspect.id) return undefined;
-    this.logger.trace('start depResolverStrategy');
+    this.logger.trace(`start depResolverStrategy for ${this.compIdStr}`);
     const { currentExt, otherExt, baseExt } = params;
 
     const currentConfig = this.getConfig(currentExt);
-    const currentPolicy = this.getPolicy(currentConfig);
+    const currentConfigPolicy = this.getPolicy(currentConfig);
     const otherConfig = this.getConfig(otherExt);
-    const otherPolicy = this.getPolicy(otherConfig);
+    const otherConfigPolicy = this.getPolicy(otherConfig);
 
     const baseConfig = baseExt ? this.getConfig(baseExt) : undefined;
-    const basePolicy = baseConfig ? this.getPolicy(baseConfig) : undefined;
+    const baseConfigPolicy = baseConfig ? this.getPolicy(baseConfig) : undefined;
+
+    this.logger.debug(`currentConfig, ${JSON.stringify(currentConfig, undefined, 2)}`);
+    this.logger.debug(`otherConfig, ${JSON.stringify(otherConfig, undefined, 2)}`);
+    this.logger.debug(`baseConfig, ${JSON.stringify(baseConfig, undefined, 2)}`);
 
     const getAllDeps = (ext: ExtensionDataList): SerializedDependencyWithPolicy[] => {
       const data = ext.findCoreExtension(DependencyResolverAspect.id)?.data.dependencies;
@@ -257,9 +263,10 @@ export class ConfigMerger {
         const getPolicyVer = () => {
           if (d.__type === 'package') return undefined; // for packages, the policy is already the version
           if (existingPolicy) return existingPolicy.value.version; // currently it's missing, will be implemented by @Gilad
-          if (!semver.valid(d.version)) return d.version; // could be a hash
-          // default to `^` or ~ if starts with zero, until we save the policy from the workspace during tag/snap.
-          return d.version.startsWith('0.') ? `~${d.version}` : `^${d.version}`;
+          return d.version;
+          // if (!semver.valid(d.version)) return d.version; // could be a hash
+          // // default to `^` or ~ if starts with zero, until we save the policy from the workspace during tag/snap.
+          // return d.version.startsWith('0.') ? `~${d.version}` : `^${d.version}`;
         };
         return {
           ...d,
@@ -320,7 +327,7 @@ export class ConfigMerger {
     const handleConfigMerge = () => {
       const addVariantPolicyEntryToPolicy = (dep: VariantPolicyEntry) => {
         const compIdStr = getCompIdStrByPkgNameFromData(dep.dependencyId);
-        if (compIdStr && this.isIdInWorkspace(compIdStr)) {
+        if (compIdStr && this.isIdInWorkspaceOrOtherLane(compIdStr, dep.value.version)) {
           // no need to add if the id exists in the workspace (regardless the version)
           return;
         }
@@ -337,8 +344,14 @@ export class ConfigMerger {
         }
         const fromCurrentDataPolicy = getFromCurrentDataPolicyByPackageName(dep.dependencyId);
         if (fromCurrentDataPolicy && fromCurrentDataPolicy.value.version === dep.value.version) {
+          // -- updated comment --
+          // not sure why this block is needed. this gets called also from this if: `if (baseConfig && this.areConfigsEqual(baseConfig, currentConfig)) {`
+          // and in this case, it's possible that current/base has 5 deps, and other just added one and it has 6.
+          // in which case, we do need to add all these 5 in additional to the new one. otherwise, only the new one appears in the final
+          // merged object, and all the 5 deps are lost.
+          // --- previous comment ---
           // that's a bug. if it's in the data.policy, it should be in data.dependencies.
-          return;
+          // return;
         }
         const depType = lifecycleToDepType[dep.lifecycleType];
         mergedPolicy[depType].push({
@@ -360,8 +373,8 @@ export class ConfigMerger {
       }
       if (baseConfig && this.areConfigsEqual(baseConfig, currentConfig)) {
         // was changed on other
-        if (otherPolicy.length) {
-          otherPolicy.forEach((dep) => {
+        if (otherConfigPolicy.length) {
+          otherConfigPolicy.forEach((dep) => {
             addVariantPolicyEntryToPolicy(dep);
           });
         }
@@ -370,12 +383,12 @@ export class ConfigMerger {
 
       // either no baseConfig, or baseConfig is also different from both: other and local. that's a conflict.
       if (!currentConfig.policy && !otherConfig.policy) return;
-      const currentAndOtherConfig = uniqBy(currentPolicy.concat(otherPolicy), (d) => d.dependencyId);
+      const currentAndOtherConfig = uniqBy(currentConfigPolicy.concat(otherConfigPolicy), (d) => d.dependencyId);
       currentAndOtherConfig.forEach((dep) => {
         const depType = lifecycleToDepType[dep.lifecycleType];
-        const currentDep = currentPolicy.find((d) => d.dependencyId === dep.dependencyId);
-        const otherDep = otherPolicy.find((d) => d.dependencyId === dep.dependencyId);
-        const baseDep = basePolicy?.find((d) => d.dependencyId === dep.dependencyId);
+        const currentDep = currentConfigPolicy.find((d) => d.dependencyId === dep.dependencyId);
+        const otherDep = otherConfigPolicy.find((d) => d.dependencyId === dep.dependencyId);
+        const baseDep = baseConfigPolicy?.find((d) => d.dependencyId === dep.dependencyId);
 
         if (!otherDep) {
           return;
@@ -399,7 +412,7 @@ export class ConfigMerger {
           return;
         }
         const compIdStr = getCompIdStrByPkgNameFromData(dep.dependencyId);
-        if (compIdStr && this.isIdInWorkspace(compIdStr)) {
+        if (compIdStr && this.isIdInWorkspaceOrOtherLane(compIdStr, otherVer)) {
           // no need to add if the id exists in the workspace (regardless the version)
           return;
         }
@@ -426,7 +439,7 @@ export class ConfigMerger {
 
     const addSerializedDepToPolicy = (dep: SerializedDependencyWithPolicy) => {
       const depType = lifecycleToDepType[dep.lifecycle];
-      if (dep.__type === 'component' && this.isIdInWorkspace(dep.id)) {
+      if (dep.__type === 'component' && this.isIdInWorkspaceOrOtherLane(dep.id, dep.version)) {
         return;
       }
       if (hasConfigForDep(depType, dep.id)) {
@@ -439,43 +452,46 @@ export class ConfigMerger {
       });
     };
 
-    this.logger.trace(
+    this.logger.debug(
       `currentData, ${currentAllData.length}\n${currentAllData
         .map((d) => `${d.__type} ${d.id} ${d.version}`)
         .join('\n')}`
     );
-    this.logger.trace(
+    this.logger.debug(
       `otherData, ${otherData.length}\n${otherData.map((d) => `${d.__type} ${d.id} ${d.version}`).join('\n')}`
     );
-    this.logger.trace(
+    this.logger.debug(
       `baseData, ${baseData.length}\n${baseData.map((d) => `${d.__type} ${d.id} ${d.version}`).join('\n')}`
     );
 
     // eslint-disable-next-line complexity
     currentAndOtherData.forEach((depData) => {
+      this.logger.trace(`depData.id, ${depData.id}`);
       if (this.isEnv(depData.id)) {
         // ignore the envs
         return;
       }
       const currentDep = currentAllData.find((d) => d.id === depData.id);
       const otherDep = otherData.find((d) => d.id === depData.id);
+      const baseDep = baseData.find((d) => d.id === depData.id);
+
       this.logger.trace(`currentDep`, currentDep);
       this.logger.trace(`otherDep`, otherDep);
+      this.logger.trace(`baseDep`, baseDep);
       if (!otherDep) {
         return;
       }
       if (!currentDep) {
+        if (baseDep) {
+          // exists in other and base, so it was removed from current
+          return;
+        }
         // only on other
         addSerializedDepToPolicy(otherDep);
         return;
       }
 
-      if (
-        currentDep.policy &&
-        otherDep.policy &&
-        isRange(currentDep.policy, currentDep.id) &&
-        isRange(otherDep.policy, otherDep.id)
-      ) {
+      if (currentDep.policy && otherDep.policy) {
         if (semver.satisfies(currentDep.version, otherDep.policy)) {
           return;
         }
@@ -483,18 +499,18 @@ export class ConfigMerger {
           return;
         }
       }
-      const currentId = currentDep.id;
+
       const currentVer = currentDep.policy || currentDep.version;
       const otherVer = otherDep.policy || otherDep.version;
       if (currentVer === otherVer) {
         return;
       }
-      const baseDep = baseData.find((d) => d.id === currentId);
       const baseVer = baseDep?.policy || baseDep?.version;
       if (baseVer && baseVer === otherVer) {
         return;
       }
-      if (currentDep.__type === 'component' && this.isIdInWorkspace(currentId)) {
+      const currentId = currentDep.id;
+      if (currentDep.__type === 'component' && this.isIdInWorkspaceOrOtherLane(currentId, otherDep.version)) {
         // dependencies that exist in the workspace, should be ignored. they'll be resolved later to the version in the ws.
         return;
       }
@@ -522,11 +538,14 @@ export class ConfigMerger {
     const config = Object.keys(mergedPolicy).length ? { policy: mergedPolicy } : undefined;
     const conflict = hasConflict ? conflictedPolicy : undefined;
 
+    this.logger.debug('final mergedConfig', config);
+    this.logger.debug('final conflict', conflict);
+
     return { id: params.id, mergedConfig: config, conflict };
   }
 
-  private isIdInWorkspace(id: string): boolean {
-    return Boolean(this.getIdFromWorkspace(id)) || this.otherLaneIdsStr.includes(id);
+  private isIdInWorkspaceOrOtherLane(id: string, versionOnOtherLane?: string): boolean {
+    return Boolean(this.getIdFromWorkspace(id)) || this.otherLaneIdsStr.includes(`${id}@${versionOnOtherLane}`);
   }
 
   private getIdFromWorkspace(id: string): ComponentID | undefined {

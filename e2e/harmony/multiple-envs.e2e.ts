@@ -1,5 +1,5 @@
 import chai, { expect } from 'chai';
-import { IssuesClasses } from '../../scopes/component/component-issues';
+import { IssuesClasses } from '@teambit/component-issues';
 
 import Helper from '../../src/e2e-helper/e2e-helper';
 
@@ -48,20 +48,6 @@ describe('multiple envs', function () {
     });
     it('bit env set should fix the issue', () => {
       helper.command.setEnv('comp1', 'teambit.harmony/aspect');
-      helper.command.expectStatusToNotHaveIssue(IssuesClasses.MultipleEnvs.name);
-    });
-  });
-  describe('env was set in previous tag and another non-core env is set now', () => {
-    before(() => {
-      helper.scopeHelper.setNewLocalAndRemoteScopes();
-      helper.fixtures.populateComponents(1);
-      helper.command.setEnv('comp1', 'teambit.mdx/mdx');
-      helper.command.tagAllWithoutBuild();
-      // it's important to have here a non-core env. otherwise, the issue won't be shown.
-      helper.command.setEnv('comp1', 'teambit.community/envs/community-mdx');
-      helper.command.status(); // run any command to get rid of pnpm output so the next command will be a valid json.
-    });
-    it('bit status should not show it as an issue', () => {
       helper.command.expectStatusToNotHaveIssue(IssuesClasses.MultipleEnvs.name);
     });
   });

@@ -1,11 +1,9 @@
-import fs from 'fs-extra';
-import path from 'path';
 import semver from 'semver';
 import parsePackageName from 'parse-package-name';
 import { initDefaultReporter } from '@pnpm/default-reporter';
 import { streamParser } from '@pnpm/logger';
 import { StoreController, WantedDependency } from '@pnpm/package-store';
-import { readModulesManifest } from '@pnpm/modules-yaml';
+import { rebuild } from '@pnpm/plugin-commands-rebuild';
 import { createOrConnectStoreController, CreateStoreControllerOptions } from '@pnpm/store-connection-manager';
 import { sortPackages } from '@pnpm/sort-packages';
 import {
@@ -27,6 +25,7 @@ import {
 import * as pnpm from '@pnpm/core';
 import { createClient, ClientOptions } from '@pnpm/client';
 import { pickRegistryForPackage } from '@pnpm/pick-registry-for-package';
+import { restartWorkerPool, finishWorkers } from '@pnpm/worker';
 import { createPkgGraph } from '@pnpm/workspace.pkgs-graph';
 import { PackageManifest, ProjectManifest, ReadPackageHook } from '@pnpm/types';
 import { Logger } from '@teambit/logger';
@@ -35,6 +34,7 @@ import { pnpmErrorToBitError } from './pnpm-error-to-bit-error';
 import { readConfig } from './read-config';
 
 const installsRunning: Record<string, Promise<any>> = {};
+const cafsLocker = new Map<string, number>();
 
 type RegistriesMap = {
   default: string;
@@ -51,12 +51,13 @@ async function createStoreController(
     registries: Registries;
     proxyConfig: PackageManagerProxyConfig;
     networkConfig: PackageManagerNetworkConfig;
-  } & Pick<CreateStoreControllerOptions, 'packageImportMethod' | 'pnpmHomeDir'>
+  } & Pick<CreateStoreControllerOptions, 'packageImportMethod' | 'pnpmHomeDir' | 'preferOffline'>
 ): Promise<{ ctrl: StoreController; dir: string }> {
   const authConfig = getAuthConfig(options.registries);
   const opts: CreateStoreControllerOptions = {
     dir: options.rootDir,
     cacheDir: options.cacheDir,
+    cafsLocker,
     storeDir: options.storeDir,
     rawConfig: authConfig,
     verifyStoreIntegrity: true,
@@ -71,6 +72,7 @@ async function createStoreController(
     maxSockets: options.networkConfig.maxSockets,
     networkConcurrency: options.networkConfig.networkConcurrency,
     packageImportMethod: options.packageImportMethod,
+    preferOffline: options.preferOffline,
     resolveSymlinksInInjectedDirs: true,
     pnpmHomeDir: options.pnpmHomeDir,
   };
@@ -146,12 +148,24 @@ export async function getPeerDependencyIssues(
     rootDir: opts.rootDir,
   });
   return pnpm.getPeerDependencyIssues(projects, {
+    autoInstallPeers: false,
+    excludeLinksFromLockfile: true,
     storeController: storeController.ctrl,
     storeDir: storeController.dir,
     overrides: opts.overrides,
     workspacePackages,
     registries: registriesMap,
   });
+}
+
+export type RebuildFn = (opts: { pending?: boolean; skipIfHasSideEffectsCache?: boolean }) => Promise<void>;
+
+export interface ReportOptions {
+  appendOnly?: boolean;
+  throttleProgress?: number;
+  hideAddedPkgsProgress?: boolean;
+  hideProgressPrefix?: boolean;
+  hideLifecycleOutput?: boolean;
 }
 
 export async function install(
@@ -169,14 +183,27 @@ export async function install(
     rootComponents?: boolean;
     rootComponentsForCapsules?: boolean;
     includeOptionalDeps?: boolean;
+    reportOptions?: ReportOptions;
+    hidePackageManagerOutput?: boolean;
+    dryRun?: boolean;
+    dedupeInjectedDeps?: boolean;
   } & Pick<
     InstallOptions,
-    'publicHoistPattern' | 'hoistPattern' | 'nodeVersion' | 'engineStrict' | 'peerDependencyRules'
+    | 'publicHoistPattern'
+    | 'hoistPattern'
+    | 'lockfileOnly'
+    | 'nodeVersion'
+    | 'engineStrict'
+    | 'excludeLinksFromLockfile'
+    | 'peerDependencyRules'
+    | 'neverBuiltDependencies'
+    | 'ignorePackageManifest'
+    | 'hoistWorkspacePackages'
   > &
-    Pick<CreateStoreControllerOptions, 'packageImportMethod' | 'pnpmHomeDir'>,
+    Pick<CreateStoreControllerOptions, 'packageImportMethod' | 'pnpmHomeDir' | 'preferOffline'>,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   logger?: Logger
-) {
+): Promise<{ dependenciesChanged: boolean; rebuild: RebuildFn; storeDir: string }> {
   let externalDependencies: Set<string> | undefined;
   const readPackage: ReadPackageHook[] = [];
   if (options?.rootComponents && !options?.rootComponentsForCapsules) {
@@ -209,6 +236,7 @@ export async function install(
     storeDir,
     cacheDir,
     registries,
+    preferOffline: options?.preferOffline,
     proxyConfig,
     networkConfig,
     packageImportMethod: options?.packageImportMethod,
@@ -216,16 +244,21 @@ export async function install(
   });
   const opts: InstallOptions = {
     allProjects,
+    autoInstallPeers: false,
+    confirmModulesPurge: false,
     storeDir: storeController.dir,
     dedupePeerDependents: true,
+    dedupeInjectedDeps: options.dedupeInjectedDeps,
     dir: rootDir,
     storeController: storeController.ctrl,
     workspacePackages,
     preferFrozenLockfile: true,
     pruneLockfileImporters: true,
-    modulesCacheMaxAge: 0,
-    neverBuiltDependencies: ['core-js'],
+    lockfileOnly: options.lockfileOnly ?? false,
+    modulesCacheMaxAge: Infinity, // pnpm should never prune the virtual store. Bit does it on its own.
+    neverBuiltDependencies: options.neverBuiltDependencies,
     registries: registriesMap,
+    resolutionMode: 'highest',
     rawConfig: authConfig,
     hooks: { readPackage },
     externalDependencies,
@@ -239,77 +272,85 @@ export async function install(
       optionalDependencies: options?.includeOptionalDeps !== false,
     },
     ...options,
+    excludeLinksFromLockfile: options.excludeLinksFromLockfile ?? true,
     peerDependencyRules: {
       allowAny: ['*'],
       ignoreMissing: ['*'],
       ...options?.peerDependencyRules,
     },
     depth: options.updateAll ? Infinity : 0,
+    disableRelinkLocalDirDeps: true,
   };
 
-  const stopReporting = initDefaultReporter({
+  let dependenciesChanged = false;
+  if (!options.dryRun) {
+    let stopReporting: Function | undefined;
+    if (!options.hidePackageManagerOutput) {
+      stopReporting = initReporter({
+        ...options.reportOptions,
+        hideAddedPkgsProgress: options.lockfileOnly,
+      });
+    }
+    try {
+      await installsRunning[rootDir];
+      await restartWorkerPool();
+      installsRunning[rootDir] = mutateModules(packagesToBuild, opts);
+      const { stats } = await installsRunning[rootDir];
+      dependenciesChanged = stats.added + stats.removed + stats.linkedToRoot > 0;
+      delete installsRunning[rootDir];
+    } catch (err: any) {
+      if (logger) {
+        logger.warn('got an error from pnpm mutateModules function', err);
+      }
+      throw pnpmErrorToBitError(err);
+    } finally {
+      stopReporting?.();
+      await finishWorkers();
+    }
+  }
+  return {
+    dependenciesChanged,
+    rebuild: async (rebuildOpts) => {
+      let stopReporting: Function | undefined;
+      const _opts = {
+        ...opts,
+        ...rebuildOpts,
+        cacheDir,
+      } as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+      if (!_opts.hidePackageManagerOutput) {
+        stopReporting = initReporter({
+          appendOnly: true,
+          hideLifecycleOutput: true,
+        });
+      }
+      try {
+        await rebuild.handler(_opts, []);
+      } finally {
+        stopReporting?.();
+      }
+    },
+    storeDir: storeController.dir,
+  };
+}
+
+function initReporter(opts?: ReportOptions) {
+  return initDefaultReporter({
     context: {
       argv: [],
     },
     reportingOptions: {
-      appendOnly: false,
-      throttleProgress: 200,
+      appendOnly: opts?.appendOnly ?? false,
+      throttleProgress: opts?.throttleProgress ?? 200,
+      hideAddedPkgsProgress: opts?.hideAddedPkgsProgress,
+      hideProgressPrefix: opts?.hideProgressPrefix,
+      hideLifecycleOutput: opts?.hideLifecycleOutput,
     },
     streamParser,
+    // Linked in core aspects are excluded from the output to reduce noise.
+    // Other @teambit/ dependencies will be shown.
+    // Only those that are symlinked from outside the workspace will be hidden.
+    filterPkgsDiff: (diff) => !diff.name.startsWith('@teambit/') || !diff.from,
   });
-  try {
-    await installsRunning[rootDir];
-    installsRunning[rootDir] = mutateModules(packagesToBuild, opts);
-    await installsRunning[rootDir];
-    delete installsRunning[rootDir];
-  } catch (err: any) {
-    throw pnpmErrorToBitError(err);
-  } finally {
-    stopReporting();
-  }
-  if (options.rootComponents) {
-    const modulesState = await readModulesManifest(path.join(rootDir, 'node_modules'));
-    if (modulesState?.injectedDeps) {
-      await linkManifestsToInjectedDeps({
-        injectedDeps: modulesState.injectedDeps,
-        manifestsByPaths,
-        rootDir,
-      });
-    }
-  }
-}
-
-/*
- * The package.json files of the components are generated into node_modules/<component pkg name>/package.json
- * This function copies the generated package.json file into all the locations of the component.
- */
-async function linkManifestsToInjectedDeps({
-  rootDir,
-  manifestsByPaths,
-  injectedDeps,
-}: {
-  rootDir: string;
-  manifestsByPaths: Record<string, ProjectManifest>;
-  injectedDeps: Record<string, string[]>;
-}) {
-  await Promise.all(
-    Object.entries(injectedDeps).map(async ([compDir, targetDirs]) => {
-      const pkgName = manifestsByPaths[path.join(rootDir, compDir)]?.name;
-      if (!pkgName) return;
-      const pkgJsonPath = path.join(rootDir, 'node_modules', pkgName, 'package.json');
-      if (fs.existsSync(pkgJsonPath)) {
-        await Promise.all(
-          targetDirs.map(async (targetDir) => {
-            try {
-              await fs.link(pkgJsonPath, path.join(targetDir, 'package.json'));
-            } catch (err: any) {
-              if (err.code !== 'EEXIST') throw err;
-            }
-          })
-        );
-      }
-    })
-  );
 }
 
 /**
@@ -325,9 +366,8 @@ function readPackageHookForCapsules(pkg: PackageManifest, workspaceDir?: string)
     return readDependencyPackageHook({
       ...pkg,
       dependencies: {
-        ...pkg.dependencies,
         ...pkg.peerDependencies,
-        ...pkg['defaultPeerDependencies'], // eslint-disable-line
+        ...pkg.dependencies,
       },
     });
   }
@@ -387,7 +427,6 @@ function readWorkspacePackageHook(pkg: PackageManifest): PackageManifest {
     ...pkg,
     dependencies: {
       ...pkg.peerDependencies,
-      ...pkg['defaultPeerDependencies'], // eslint-disable-line
       ...newDeps,
     },
   };

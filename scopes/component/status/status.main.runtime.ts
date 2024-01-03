@@ -1,16 +1,17 @@
 import { CLIAspect, CLIMain, MainRuntime } from '@teambit/cli';
 import pMapSeries from 'p-map-series';
 import { LaneId } from '@teambit/lane-id';
-import { IssuesList } from '@teambit/component-issues';
+import { IssuesClasses, IssuesList } from '@teambit/component-issues';
 import WorkspaceAspect, { OutsideWorkspaceError, Workspace } from '@teambit/workspace';
+import LanesAspect, { LanesMain } from '@teambit/lanes';
 import { ComponentID } from '@teambit/component-id';
+import { Component, InvalidComponent } from '@teambit/component';
 import { Analytics } from '@teambit/legacy/dist/analytics/analytics';
 import loader from '@teambit/legacy/dist/cli/loader';
 import { BEFORE_STATUS } from '@teambit/legacy/dist/cli/loader/loader-messages';
 import { RemoveAspect, RemoveMain } from '@teambit/remove';
 import ConsumerComponent from '@teambit/legacy/dist/consumer/component';
 import ComponentsPendingImport from '@teambit/legacy/dist/consumer/component-ops/exceptions/components-pending-import';
-import { BitId } from '@teambit/legacy-bit-id';
 import ComponentsList from '@teambit/legacy/dist/consumer/component/components-list';
 import { ModelComponent } from '@teambit/legacy/dist/scope/models';
 import { InsightsAspect, InsightsMain } from '@teambit/insights';
@@ -18,6 +19,7 @@ import { SnapsDistance } from '@teambit/legacy/dist/scope/component-ops/snaps-di
 import IssuesAspect, { IssuesMain } from '@teambit/issues';
 import { StatusCmd } from './status-cmd';
 import { StatusAspect } from './status.aspect';
+import { MiniStatusCmd, MiniStatusOpts } from './mini-status-cmd';
 
 type DivergeDataPerId = { id: ComponentID; divergeData: SnapsDistance };
 
@@ -41,6 +43,13 @@ export type StatusResult = {
   unavailableOnMain: ComponentID[];
   currentLaneId: LaneId;
   forkedLaneId?: LaneId;
+  workspaceIssues: string[];
+};
+
+export type MiniStatusResults = {
+  modified: ComponentID[];
+  newComps: ComponentID[];
+  compWithIssues?: Component[];
 };
 
 export class StatusMain {
@@ -48,19 +57,29 @@ export class StatusMain {
     private workspace: Workspace,
     private issues: IssuesMain,
     private insights: InsightsMain,
-    private remove: RemoveMain
+    private remove: RemoveMain,
+    private lanes: LanesMain
   ) {}
 
-  async status({ lanes }: { lanes?: boolean }): Promise<StatusResult> {
+  async status({
+    lanes,
+    ignoreCircularDependencies,
+  }: {
+    lanes?: boolean;
+    ignoreCircularDependencies?: boolean;
+  }): Promise<StatusResult> {
     if (!this.workspace) throw new OutsideWorkspaceError();
     loader.start(BEFORE_STATUS);
-    const consumer = this.workspace.consumer;
-    const laneObj = await consumer.getCurrentLaneObject();
-    const componentsList = new ComponentsList(consumer);
     const loadOpts = {
       loadDocs: false,
       loadCompositions: false,
     };
+    const { components: allComps, invalidComponents: allInvalidComponents } = await this.workspace.listWithInvalid(
+      loadOpts
+    );
+    const consumer = this.workspace.consumer;
+    const laneObj = await consumer.getCurrentLaneObject();
+    const componentsList = new ComponentsList(consumer);
     const newComponents: ConsumerComponent[] = (await componentsList.listNewComponents(
       true,
       loadOpts
@@ -71,7 +90,7 @@ export class StatusMain {
     const stagedComponentsWithVersions = await pMapSeries(stagedComponents, async (stagedComp) => {
       const versions = await stagedComp.getLocalTagsOrHashes(consumer.scope.objects);
       return {
-        id: stagedComp.toBitId(),
+        id: stagedComp.toComponentId(),
         versions,
       };
     });
@@ -79,56 +98,44 @@ export class StatusMain {
     const unavailableOnMain = await this.workspace.getUnavailableOnMainComponents();
     const autoTagPendingComponents = await componentsList.listAutoTagPendingComponents();
     const autoTagPendingComponentsIds = autoTagPendingComponents.map((component) => component.id);
-    const allInvalidComponents = await componentsList.listInvalidComponents();
     const locallySoftRemoved = await componentsList.listLocallySoftRemoved();
     const remotelySoftRemoved = await componentsList.listRemotelySoftRemoved();
     const importPendingComponents = allInvalidComponents
-      // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
-      .filter((c) => c.error instanceof ComponentsPendingImport)
-      // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
+      .filter((c) => c.err instanceof ComponentsPendingImport)
       .map((i) => i.id);
     // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
     const invalidComponents = allInvalidComponents.filter((c) => !(c.error instanceof ComponentsPendingImport));
+    const divergeInvalid = await this.divergeDataErrorsToInvalidComp(allComps);
+    invalidComponents.push(...divergeInvalid);
     const outdatedComponents = await componentsList.listOutdatedComponents();
     const idsDuringMergeState = componentsList.listDuringMergeStateComponents();
-    const { components: componentsDuringMergeState } = await this.workspace.consumer.loadComponents(
-      idsDuringMergeState,
-      false
-    );
     const mergePendingComponents = await componentsList.listMergePendingComponents();
-    const legacyCompsWithPotentialIssues: ConsumerComponent[] = [
-      ...newComponents,
-      ...modifiedComponents,
-      ...componentsDuringMergeState,
-    ];
-    const issuesToIgnore = this.issues.getIssuesToIgnoreGlobally();
-    if (legacyCompsWithPotentialIssues.length) {
-      const compsWithPotentialIssues = await this.workspace.getManyByLegacy(legacyCompsWithPotentialIssues, loadOpts);
-      await this.issues.triggerAddComponentIssues(compsWithPotentialIssues, issuesToIgnore);
-      this.issues.removeIgnoredIssuesFromComponents(compsWithPotentialIssues);
+    if (allComps.length) {
+      const issuesFromFlag = ignoreCircularDependencies ? [IssuesClasses.CircularDependencies.name] : [];
+      const issuesToIgnore = [...this.issues.getIssuesToIgnoreGlobally(), ...issuesFromFlag];
+      await this.issues.triggerAddComponentIssues(allComps, issuesToIgnore);
+      this.issues.removeIgnoredIssuesFromComponents(allComps);
     }
-    const componentsWithIssues = legacyCompsWithPotentialIssues.filter((component: ConsumerComponent) => {
-      return component.issues && !component.issues.isEmpty();
-    });
-
-    const softTaggedComponents = componentsList.listSoftTaggedComponents();
-    const snappedComponents = (await componentsList.listSnappedComponentsOnMain()).map((c) => c.toBitId());
+    const componentsWithIssues = allComps.filter((component) => !component.state.issues.isEmpty());
+    const softTaggedComponents = this.workspace.filter.bySoftTagged();
+    const snappedComponents = await this.workspace.filter.bySnappedOnMain();
     const pendingUpdatesFromMain = lanes ? await componentsList.listUpdatesFromMainPending() : [];
-    const updatesFromForked = lanes ? await componentsList.listUpdatesFromForked() : [];
+    const updatesFromForked = lanes ? await this.lanes.listUpdatesFromForked(componentsList) : [];
     const currentLaneId = consumer.getCurrentLaneId();
     const currentLane = await consumer.getCurrentLaneObject();
     const forkedLaneId = currentLane?.forkedFrom;
+    const workspaceIssues = this.workspace.getWorkspaceIssues();
     Analytics.setExtraData('new_components', newComponents.length);
     Analytics.setExtraData('staged_components', stagedComponents.length);
     Analytics.setExtraData('num_components_with_missing_dependencies', componentsWithIssues.length);
     Analytics.setExtraData('autoTagPendingComponents', autoTagPendingComponents.length);
     Analytics.setExtraData('deleted', invalidComponents.length);
 
-    const convertBitIdToComponentIdsAndSort = async (ids: BitId[]) =>
+    const convertBitIdToComponentIdsAndSort = async (ids: ComponentID[]) =>
       ComponentID.sortIds(await this.workspace.resolveMultipleComponentIds(ids));
 
     const convertObjToComponentIdsAndSort = async <T>(
-      objectsWithId: Array<T & { id: BitId }>
+      objectsWithId: Array<T & { id: ComponentID }>
     ): Promise<Array<T & { id: ComponentID }>> => {
       const results = await Promise.all(
         objectsWithId.map(async (obj) => {
@@ -141,20 +148,19 @@ export class StatusMain {
       return results.sort((a, b) => a.id.toString().localeCompare(b.id.toString()));
     };
 
-    await consumer.onDestroy();
+    const sortObjectsWithId = <T>(objectsWithId: Array<T & { id: ComponentID }>): Array<T & { id: ComponentID }> => {
+      return objectsWithId.sort((a, b) => a.id.toString().localeCompare(b.id.toString()));
+    };
+
+    await consumer.onDestroy('status');
     return {
       newComponents: await convertBitIdToComponentIdsAndSort(newComponents.map((c) => c.id)),
       modifiedComponents: await convertBitIdToComponentIdsAndSort(modifiedComponents.map((c) => c.id)),
       stagedComponents: await convertObjToComponentIdsAndSort(stagedComponentsWithVersions),
-      // @ts-ignore - not clear why, it fails the "bit build" without it
-      componentsWithIssues: await convertObjToComponentIdsAndSort(
-        componentsWithIssues.map((c) => ({ id: c.id, issues: c.issues }))
-      ), // no need to sort, we don't print it as is
-      importPendingComponents: await convertBitIdToComponentIdsAndSort(importPendingComponents), // no need to sort, we use only its length
+      componentsWithIssues: sortObjectsWithId(componentsWithIssues.map((c) => ({ id: c.id, issues: c.state.issues }))),
+      importPendingComponents, // no need to sort, we use only its length
       autoTagPendingComponents: await convertBitIdToComponentIdsAndSort(autoTagPendingComponentsIds),
-      invalidComponents: await convertObjToComponentIdsAndSort(
-        invalidComponents.map((c) => ({ id: c.id, error: c.error }))
-      ),
+      invalidComponents: sortObjectsWithId(invalidComponents.map((c) => ({ id: c.id, error: c.err }))),
       locallySoftRemoved: await convertBitIdToComponentIdsAndSort(locallySoftRemoved),
       remotelySoftRemoved: await convertBitIdToComponentIdsAndSort(remotelySoftRemoved.map((c) => c.id)),
       outdatedComponents: await convertObjToComponentIdsAndSort(
@@ -168,22 +174,48 @@ export class StatusMain {
         mergePendingComponents.map((c) => ({ id: c.id, divergeData: c.diverge }))
       ),
       componentsDuringMergeState: await convertBitIdToComponentIdsAndSort(idsDuringMergeState),
-      softTaggedComponents: await convertBitIdToComponentIdsAndSort(softTaggedComponents),
+      softTaggedComponents: ComponentID.sortIds(softTaggedComponents),
       snappedComponents: await convertBitIdToComponentIdsAndSort(snappedComponents),
       pendingUpdatesFromMain: await convertObjToComponentIdsAndSort(pendingUpdatesFromMain),
       updatesFromForked: await convertObjToComponentIdsAndSort(updatesFromForked),
       unavailableOnMain,
       currentLaneId,
       forkedLaneId,
+      workspaceIssues: workspaceIssues.map((err) => err.message),
     };
+  }
+
+  async statusMini(componentPattern?: string, opts: MiniStatusOpts = {}): Promise<MiniStatusResults> {
+    const ids = componentPattern ? await this.workspace.idsByPattern(componentPattern) : await this.workspace.listIds();
+    const compFiles = await pMapSeries(ids, (id) => this.workspace.getFilesModification(id));
+    const modified: ComponentID[] = [];
+    const newComps: ComponentID[] = [];
+    compFiles.forEach((comp) => {
+      if (!comp.id.hasVersion()) newComps.push(comp.id);
+      if (comp.isModified()) modified.push(comp.id);
+    });
+    const loadOpts = {
+      loadDocs: false,
+      loadCompositions: false,
+    };
+    const comps = opts.showIssues ? await this.workspace.getMany(ids, loadOpts) : [];
+    if (opts.showIssues) {
+      const issuesFromFlag = opts.ignoreCircularDependencies ? [IssuesClasses.CircularDependencies.name] : [];
+      const issuesToIgnore = [...this.issues.getIssuesToIgnoreGlobally(), ...issuesFromFlag];
+      await this.issues.triggerAddComponentIssues(comps, issuesToIgnore);
+      this.issues.removeIgnoredIssuesFromComponents(comps);
+    }
+    const compWithIssues = comps.filter((c) => !c.state.issues.isEmpty());
+
+    return { modified, newComps, compWithIssues };
   }
 
   private async addRemovedStagedIfNeeded(stagedComponents: ModelComponent[]) {
     const removedStagedIds = await this.remove.getRemovedStaged();
     if (!removedStagedIds.length) return;
-    const removedStagedBitIds = removedStagedIds.map((id) => id._legacy);
+    const removedStagedBitIds = removedStagedIds.map((id) => id);
     const nonExistsInStaged = removedStagedBitIds.filter(
-      (id) => !stagedComponents.find((c) => c.toBitId().isEqualWithoutVersion(id))
+      (id) => !stagedComponents.find((c) => c.toComponentId().isEqualWithoutVersion(id))
     );
     if (!nonExistsInStaged.length) return;
     const modelComps = await Promise.all(
@@ -192,18 +224,35 @@ export class StatusMain {
     stagedComponents.push(...modelComps);
   }
 
+  private async divergeDataErrorsToInvalidComp(components: Component[]): Promise<InvalidComponent[]> {
+    const invalidComponents: InvalidComponent[] = [];
+    await Promise.all(
+      components.map(async (component) => {
+        const comp = component.state._consumer as ConsumerComponent;
+        if (!comp.modelComponent) return;
+        await comp.modelComponent.setDivergeData(this.workspace.scope.legacyScope.objects, false);
+        const divergeData = comp.modelComponent.getDivergeData();
+        if (divergeData.err) {
+          invalidComponents.push({ id: component.id, err: divergeData.err });
+        }
+      })
+    );
+    return invalidComponents;
+  }
+
   static slots = [];
-  static dependencies = [CLIAspect, WorkspaceAspect, InsightsAspect, IssuesAspect, RemoveAspect];
+  static dependencies = [CLIAspect, WorkspaceAspect, InsightsAspect, IssuesAspect, RemoveAspect, LanesAspect];
   static runtime = MainRuntime;
-  static async provider([cli, workspace, insights, issues, remove]: [
+  static async provider([cli, workspace, insights, issues, remove, lanes]: [
     CLIMain,
     Workspace,
     InsightsMain,
     IssuesMain,
-    RemoveMain
+    RemoveMain,
+    LanesMain
   ]) {
-    const statusMain = new StatusMain(workspace, issues, insights, remove);
-    cli.register(new StatusCmd(statusMain));
+    const statusMain = new StatusMain(workspace, issues, insights, remove, lanes);
+    cli.register(new StatusCmd(statusMain), new MiniStatusCmd(statusMain));
     return statusMain;
   }
 }

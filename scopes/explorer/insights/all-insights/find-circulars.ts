@@ -3,6 +3,7 @@ import { IssuesClasses } from '@teambit/component-issues';
 import { GraphMain } from '@teambit/graph';
 import { uniq } from 'lodash';
 import { Insight, InsightResult, RawResult } from '../insight';
+import { RunInsightOptions } from '../insight-manager';
 
 export const INSIGHT_CIRCULAR_DEPS_NAME = 'circular';
 
@@ -13,15 +14,15 @@ export default class FindCycles implements Insight {
   constructor(graphBuilder: GraphMain) {
     this.graphBuilder = graphBuilder;
   }
-  private async runInsight(): Promise<RawResult> {
-    const graph = await this.graphBuilder.getGraphIds();
+  private async runInsight(opts?: RunInsightOptions): Promise<RawResult> {
+    const graph = await this.graphBuilder.getGraphIds(opts?.ids);
     if (!graph) {
       return {
         message: '',
         data: undefined,
       };
     }
-    const cycles = graph.findCycles();
+    const cycles = graph.findCycles(undefined, opts?.includeDeps);
     if (cycles.length === 1) {
       return {
         message: `Found ${cycles.length} cycle.`,
@@ -48,8 +49,8 @@ export default class FindCycles implements Insight {
     return string;
   }
 
-  async run(): Promise<InsightResult> {
-    const bareResult = await this.runInsight();
+  async run(opts?: RunInsightOptions): Promise<InsightResult> {
+    const bareResult = await this.runInsight(opts);
     const renderedData = this.renderData(bareResult);
     const result: InsightResult = {
       metaData: {
@@ -68,7 +69,7 @@ export default class FindCycles implements Insight {
   }
 
   async addAsComponentIssue(components: Component[]) {
-    const result = await this.runInsight();
+    const result = await this.runInsight({ ids: components.map((c) => c.id) });
     if (!result.data.length) {
       return; // no circulars
     }

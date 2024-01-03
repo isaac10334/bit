@@ -1,18 +1,21 @@
 /* eslint-disable max-classes-per-file */
 import mapSeries from 'p-map-series';
-import { Component, ComponentID } from '@teambit/component';
+import { Component } from '@teambit/component';
 import { EnvsMain } from '@teambit/envs';
 import type { PubsubMain } from '@teambit/pubsub';
 import { SerializableResults, Workspace, OutsideWorkspaceError } from '@teambit/workspace';
 import { WatcherMain, WatchOptions } from '@teambit/watcher';
 import path from 'path';
-import { BitId } from '@teambit/legacy-bit-id';
+import { ComponentID } from '@teambit/component-id';
 import { Logger } from '@teambit/logger';
 import loader from '@teambit/legacy/dist/cli/loader';
 import { DEFAULT_DIST_DIRNAME } from '@teambit/legacy/dist/constants';
 import { AbstractVinyl, Dist } from '@teambit/legacy/dist/consumer/component/sources';
 import DataToPersist from '@teambit/legacy/dist/consumer/component/sources/data-to-persist';
-import { linkToNodeModulesByComponents } from '@teambit/workspace.modules.node-modules-linker';
+import {
+  linkToNodeModulesByComponents,
+  removeLinksFromNodeModules,
+} from '@teambit/workspace.modules.node-modules-linker';
 import { AspectLoaderMain } from '@teambit/aspect-loader';
 import { DependencyResolverMain } from '@teambit/dependency-resolver';
 import componentIdToPackageName from '@teambit/legacy/dist/utils/bit/component-id-to-package-name';
@@ -39,6 +42,9 @@ export type CompileOptions = {
    */
   deleteDistDir?: boolean;
   initiator: CompilationInitiator; // describes where the compilation is coming from
+  // should we create links in node_modules for the compiled components (default = true)
+  // this will link the source files, and create the package.json
+  linkComponents?: boolean;
 };
 
 export type CompileError = { path: string; error: Error };
@@ -98,6 +104,10 @@ export class ComponentCompiler {
     dataToPersist.addManyFiles(this.dists);
     dataToPersist.addBasePath(this.workspace.path);
     await dataToPersist.persistAllToFS();
+    const linkComponents = options.linkComponents ?? true;
+    if (linkComponents) {
+      await linkToNodeModulesByComponents([this.component], this.workspace);
+    }
     const buildResults = this.dists.map((distFile) => distFile.path);
     if (this.component.state._consumer.compiler) loader.succeed();
     this.pubsub.pub(
@@ -135,14 +145,7 @@ ${this.compileErrors.map(formatError).join('\n')}`);
   }
 
   private async getInjectedDirs(packageName: string): Promise<string[]> {
-    const relativeCompDir = this.workspace.componentDir(this.component.id, undefined, {
-      relative: true,
-    });
-    const injectedDirs = await this.dependencyResolver.getInjectedDirs(
-      this.workspace.path,
-      relativeCompDir,
-      packageName
-    );
+    const injectedDirs = await this.workspace.getInjectedDirs(this.component);
     if (injectedDirs.length > 0) return injectedDirs;
 
     const rootDirs = await readBitRootsDir(this.workspace.path);
@@ -159,7 +162,7 @@ ${this.compileErrors.map(formatError).join('\n')}`);
     let compileResults;
     if (isFileSupported) {
       try {
-        compileResults = this.compilerInstance.transpileFile?.(file.contents.toString(), options);
+        compileResults = await this.compilerInstance.transpileFile?.(file.contents.toString(), options);
       } catch (error: any) {
         this.compileErrors.push({ path: file.path, error });
         return;
@@ -209,7 +212,7 @@ ${this.compileErrors.map(formatError).join('\n')}`);
         await this.compilerInstance.transpileComponent?.({
           component,
           componentDir: this.componentDir,
-          outputDir: this.workspace.getComponentPackagePath(component),
+          outputDir: await this.workspace.getComponentPackagePath(component),
           initiator,
         });
       } catch (error: any) {
@@ -232,25 +235,29 @@ export class WorkspaceCompiler {
   ) {
     if (this.workspace) {
       this.workspace.registerOnComponentChange(this.onComponentChange.bind(this));
-      this.workspace.registerOnComponentAdd(this.onComponentChange.bind(this));
+      this.workspace.registerOnComponentAdd(this.onComponentAdd.bind(this));
       this.watcher.registerOnPreWatch(this.onPreWatch.bind(this));
-      this.ui.registerPreStart(this.onPreStart.bind(this));
     }
+    this.ui.registerPreStart(this.onPreStart.bind(this));
     if (this.aspectLoader) {
       this.aspectLoader.registerOnAspectLoadErrorSlot(this.onAspectLoadFail.bind(this));
     }
   }
 
   async onPreStart(preStartOpts: PreStartOpts): Promise<void> {
-    if (preStartOpts.skipCompilation) {
-      return;
+    if (this.workspace) {
+      if (preStartOpts.skipCompilation) {
+        return;
+      }
+      await this.compileComponents([], {
+        changed: true,
+        verbose: false,
+        deleteDistDir: false,
+        initiator: CompilationInitiator.PreStart,
+      });
+    } else {
+      await this.watcher.watchScopeInternalFiles();
     }
-    await this.compileComponents([], {
-      changed: true,
-      verbose: false,
-      deleteDistDir: false,
-      initiator: CompilationInitiator.PreStart,
-    });
   }
 
   async onAspectLoadFail(err: Error & { code?: string }, id: ComponentID): Promise<boolean> {
@@ -261,17 +268,29 @@ export class WorkspaceCompiler {
     return false;
   }
 
+  async onComponentAdd(component: Component, files: string[], watchOpts: WatchOptions) {
+    return this.onComponentChange(component, files, undefined, watchOpts);
+  }
+
   async onComponentChange(
     component: Component,
     files: string[],
-    initiator?: CompilationInitiator
-  ): Promise<SerializableResults> {
+    removedFiles: string[] = [],
+    watchOpts: WatchOptions
+  ): Promise<SerializableResults | void> {
+    if (!watchOpts.compile) return undefined;
+    // when files are removed, we need to remove the dist directories and the old symlinks, otherwise, it has
+    // symlinks to non-exist files and the dist has stale files
+    const deleteDistDir = Boolean(removedFiles?.length);
+    if (removedFiles?.length) {
+      await removeLinksFromNodeModules(component, this.workspace, removedFiles);
+    }
     const buildResults = await this.compileComponents(
       [component.id.toString()],
-      { initiator: initiator || CompilationInitiator.ComponentChanged },
+      { initiator: watchOpts.initiator || CompilationInitiator.ComponentChanged, deleteDistDir },
       true
     );
-    await linkToNodeModulesByComponents([component], this.workspace);
+    // await linkToNodeModulesByComponents([component], this.workspace);
     return {
       results: buildResults,
       toString() {
@@ -280,27 +299,30 @@ export class WorkspaceCompiler {
     };
   }
 
-  async onPreWatch(components: Component[], watchOpts: WatchOptions) {
+  async onPreWatch(componentIds: ComponentID[], watchOpts: WatchOptions) {
     if (watchOpts.preCompile) {
       const start = Date.now();
-      this.logger.console(`compiling ${components.length} components`);
+      this.logger.console(`compiling ${componentIds.length} components`);
       await this.compileComponents(
-        components.map((c) => c.id._legacy),
+        componentIds.map((id) => id),
         { initiator: CompilationInitiator.PreWatch }
       );
       const end = Date.now() - start;
-      this.logger.consoleSuccess(`compiled ${components.length} components successfully (${end / 1000} sec)`);
+      this.logger.consoleSuccess(`compiled ${componentIds.length} components successfully (${end / 1000} sec)`);
     }
   }
 
   async compileComponents(
-    componentsIds: string[] | BitId[] | ComponentID[], // when empty, it compiles new+modified (unless options.all is set),
+    componentsIds: string[] | ComponentID[] | ComponentID[], // when empty, it compiles new+modified (unless options.all is set),
     options: CompileOptions,
     noThrow?: boolean
   ): Promise<BuildResult[]> {
     if (!this.workspace) throw new OutsideWorkspaceError();
     const componentIds = await this.getIdsToCompile(componentsIds, options.changed);
-    const components = await this.workspace.getMany(componentIds);
+    // In case the aspect failed to load, we want to compile it without try to re-load it again
+    const getManyOpts =
+      options.initiator === CompilationInitiator.AspectLoadFail ? { loadSeedersAsAspects: false } : undefined;
+    const components = await this.workspace.getMany(componentIds, getManyOpts);
 
     const grouped = this.groupByIsEnv(components);
     const envsResults = grouped.envs ? await this.runCompileComponents(grouped.envs, options, noThrow) : [];
@@ -318,9 +340,8 @@ export class WorkspaceCompiler {
     components.forEach((c) => {
       const environment = this.envs.getEnv(c).env;
       const compilerInstance = environment.getCompiler?.();
-      // if there is no componentDir (e.g. author that added files, not dir), then we can't write the dists
-      // inside the component dir.
-      if (compilerInstance && c.state._consumer.componentMap?.getComponentDir()) {
+
+      if (compilerInstance) {
         const compilerName = compilerInstance.constructor.name || 'compiler';
         componentsCompilers.push(
           new ComponentCompiler(
@@ -333,6 +354,8 @@ export class WorkspaceCompiler {
             this.dependencyResolver
           )
         );
+      } else {
+        this.logger.warn(`unable to find a compiler instance for ${c.id.toString()}`);
       }
     });
     const resultOnWorkspace = await mapSeries(componentsCompilers, (componentCompiler) =>
@@ -360,15 +383,16 @@ export class WorkspaceCompiler {
   }
 
   private async getIdsToCompile(
-    componentsIds: Array<string | ComponentID | BitId>,
+    componentsIds: Array<string | ComponentID | ComponentID>,
     changed = false
   ): Promise<ComponentID[]> {
     if (componentsIds.length) {
-      return this.workspace.resolveMultipleComponentIds(componentsIds);
+      const componentIds = await this.workspace.resolveMultipleComponentIds(componentsIds);
+      return this.workspace.filterIds(componentIds);
     }
     if (changed) {
       return this.workspace.getNewAndModifiedIds();
     }
-    return this.workspace.getAllComponentIds();
+    return this.workspace.listIds();
   }
 }

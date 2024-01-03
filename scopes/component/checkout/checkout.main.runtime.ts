@@ -1,77 +1,78 @@
 import { CLIAspect, CLIMain, MainRuntime } from '@teambit/cli';
 import { Logger, LoggerAspect, LoggerMain } from '@teambit/logger';
 import WorkspaceAspect, { OutsideWorkspaceError, Workspace } from '@teambit/workspace';
-import { BitId } from '@teambit/legacy-bit-id';
 import { BitError } from '@teambit/bit-error';
 import { compact } from 'lodash';
 import { BEFORE_CHECKOUT } from '@teambit/legacy/dist/cli/loader/loader-messages';
-import { ApplyVersionResults } from '@teambit/merging';
+import RemoveAspect, { RemoveMain } from '@teambit/remove';
+import { ApplyVersionResults, FailedComponents } from '@teambit/merging';
+import ImporterAspect, { ImporterMain } from '@teambit/importer';
 import { HEAD, LATEST } from '@teambit/legacy/dist/constants';
 import { ComponentWriterAspect, ComponentWriterMain } from '@teambit/component-writer';
 import {
-  applyVersion,
-  markFilesToBeRemovedIfNeeded,
-  ComponentStatus,
-  deleteFilesIfNeeded,
-} from '@teambit/legacy/dist/consumer/versions-ops/checkout-version';
-import {
-  FailedComponents,
   getMergeStrategyInteractive,
   MergeStrategy,
   threeWayMerge,
 } from '@teambit/legacy/dist/consumer/versions-ops/merge-version';
 import GeneralError from '@teambit/legacy/dist/error/general-error';
 import mapSeries from 'p-map-series';
-import { BitIds } from '@teambit/legacy/dist/bit-id';
-import { Version, ModelComponent } from '@teambit/legacy/dist/scope/models';
+import { ComponentIdList, ComponentID } from '@teambit/component-id';
+import { Version, ModelComponent, Lane } from '@teambit/legacy/dist/scope/models';
 import { Tmp } from '@teambit/legacy/dist/scope/repositories';
-import ConsumerComponent from '@teambit/legacy/dist/consumer/component';
-import { ComponentID } from '@teambit/component-id';
+import ComponentNotFoundInPath from '@teambit/legacy/dist/consumer/component/exceptions/component-not-found-in-path';
 import { CheckoutCmd } from './checkout-cmd';
 import { CheckoutAspect } from './checkout.aspect';
+import { applyVersion, ComponentStatus, ComponentStatusBase, throwForFailures } from './checkout-version';
+import { RevertCmd } from './revert-cmd';
 
 export type CheckoutProps = {
-  version?: string; // if reset is true, the version is undefined
+  version?: string; // if reset/head/latest is true, the version is undefined
   ids?: ComponentID[];
   head?: boolean;
   latest?: boolean;
+  main?: boolean; // relevant for "revert" only
   promptMergeOptions?: boolean;
   mergeStrategy?: MergeStrategy | null;
   verbose?: boolean;
   skipNpmInstall?: boolean;
   reset?: boolean; // remove local changes. if set, the version is undefined.
+  revert?: boolean; // change the files according to the given version, but don't change the bitmap version and don't try to merge
   all?: boolean; // checkout all ids
   isLane?: boolean;
-  entireLane?: boolean;
+  lane?: Lane; // currently needed for "bit switch" to tell the "fetch" where to fetch from
+  workspaceOnly?: boolean;
+  versionPerId?: ComponentID[]; // if given, the ComponentID.version is the version to checkout to.
+  skipUpdatingBitmap?: boolean; // needed for stash
+  restoreMissingComponents?: boolean; // in case .bitmap has a component and it's missing from the workspace, restore it (from model)
+  allowAddingComponentsFromScope?: boolean; // in case the id doesn't exist in .bitmap, add it from the scope (relevant for switch)
+  includeLocallyDeleted?: boolean; // include components that were deleted locally. currently enabled for "bit checkout reset" only.
 };
 
-export type ComponentStatusBeforeMergeAttempt = {
-  componentFromFS?: ConsumerComponent;
-  componentFromModel?: Version;
-  id: BitId;
-  failureMessage?: string;
-  unchangedLegitimately?: boolean; // failed to checkout but for a legitimate reason, such as, up-to-date
+export type ComponentStatusBeforeMergeAttempt = ComponentStatusBase & {
   propsForMerge?: {
     currentlyUsedVersion: string;
     componentModel: ModelComponent;
   };
 };
 
-type CheckoutTo = 'head' | 'reset' | string;
-
 export class CheckoutMain {
-  constructor(private workspace: Workspace, private logger: Logger, private componentWriter: ComponentWriterMain) {}
+  constructor(
+    private workspace: Workspace,
+    private logger: Logger,
+    private componentWriter: ComponentWriterMain,
+    private importer: ImporterMain,
+    private remove: RemoveMain
+  ) {}
 
   async checkout(checkoutProps: CheckoutProps): Promise<ApplyVersionResults> {
     const consumer = this.workspace.consumer;
     const { version, ids, promptMergeOptions } = checkoutProps;
     await this.syncNewComponents(checkoutProps);
-    await this.workspace.scope.import(ids || [], { useCache: false, preferDependencyGraph: true });
-    const bitIds = BitIds.fromArray(ids?.map((id) => id._legacy) || []);
-    const { components } = await consumer.loadComponents(bitIds);
-
-    const allComponentStatusBeforeMerge = await Promise.all(
-      components.map((component) => this.getComponentStatusBeforeMergeAttempt(component, checkoutProps))
+    const addedComponents = await this.restoreMissingComponents(checkoutProps);
+    const bitIds = ComponentIdList.fromArray(ids?.map((id) => id) || []);
+    // don't use Promise.all, it loads the components and this operation must be in sequence.
+    const allComponentStatusBeforeMerge = await mapSeries(bitIds, (id) =>
+      this.getComponentStatusBeforeMergeAttempt(id, checkoutProps)
     );
     const compsNeedMerge = allComponentStatusBeforeMerge.filter((c) => c.propsForMerge);
     const compsNotNeedMerge = allComponentStatusBeforeMerge.filter((c) => !c.propsForMerge) as ComponentStatus[];
@@ -86,8 +87,10 @@ export class CheckoutMain {
         return idsToImport;
       })
       .flat();
-    await this.workspace.scope.legacyScope.scopeImporter.importManyIfMissingWithoutDeps({
-      ids: BitIds.fromArray(toImport),
+
+    await this.workspace.scope.legacyScope.scopeImporter.importWithoutDeps(ComponentIdList.fromArray(toImport), {
+      cache: true,
+      lane: checkoutProps.lane,
     });
 
     const getComponentsStatusOfMergeNeeded = async (): Promise<ComponentStatus[]> => {
@@ -111,28 +114,30 @@ export class CheckoutMain {
     if (componentWithConflict) {
       if (!promptMergeOptions && !checkoutProps.mergeStrategy) {
         throw new GeneralError(
-          `automatic merge has failed for component ${componentWithConflict.id.toStringWithoutVersion()}.\nplease use "--manual" to manually merge changes or use "--theirs / --ours" to choose one of the conflicted versions`
+          `automatic merge has failed for component ${componentWithConflict.id.toStringWithoutVersion()}.\nplease use "--auto-merge-resolve" with 'manual', 'ours' or 'theirs' to resolve the conflict/s`
         );
       }
       if (!checkoutProps.mergeStrategy) checkoutProps.mergeStrategy = await getMergeStrategyInteractive();
     }
+
+    throwForFailures(allComponentsStatus);
+
     const failedComponents: FailedComponents[] = allComponentsStatus
-      .filter((componentStatus) => componentStatus.failureMessage)
+      .filter((componentStatus) => componentStatus.unchangedMessage)
+      .filter((componentStatus) => !componentStatus.shouldBeRemoved)
       .map((componentStatus) => ({
         id: componentStatus.id,
-        failureMessage: componentStatus.failureMessage as string,
+        unchangedMessage: componentStatus.unchangedMessage as string,
         unchangedLegitimately: componentStatus.unchangedLegitimately,
       }));
 
-    const succeededComponents = allComponentsStatus.filter((componentStatus) => !componentStatus.failureMessage);
+    const succeededComponents = allComponentsStatus.filter((componentStatus) => !componentStatus.unchangedMessage);
     // do not use Promise.all for applyVersion. otherwise, it'll write all components in parallel,
     // which can be an issue when some components are also dependencies of others
-    const checkoutPropsLegacy = { ...checkoutProps, ids: checkoutProps.ids?.map((id) => id._legacy) };
-    const componentsResults = await mapSeries(succeededComponents, ({ id, componentFromFS, mergeResults }) => {
-      return applyVersion(consumer, id, componentFromFS, mergeResults, checkoutPropsLegacy);
+    const checkoutPropsLegacy = { ...checkoutProps, ids: checkoutProps.ids?.map((id) => id) };
+    const componentsResults = await mapSeries(succeededComponents, ({ id, currentComponent, mergeResults }) => {
+      return applyVersion(consumer, id, currentComponent, mergeResults, checkoutPropsLegacy);
     });
-
-    markFilesToBeRemovedIfNeeded(succeededComponents, componentsResults);
 
     const componentsLegacy = compact(componentsResults.map((c) => c.component));
 
@@ -140,9 +145,9 @@ export class CheckoutMain {
     let newFromLaneAdded = false;
     if (checkoutProps.head) {
       newFromLane = await this.getNewComponentsFromLane(checkoutProps.ids || []);
-      if (checkoutProps.entireLane) {
+      if (!checkoutProps.workspaceOnly) {
         const compsNewFromLane = await Promise.all(
-          newFromLane.map((id) => consumer.loadComponentFromModelImportIfNeeded(id._legacy))
+          newFromLane.map((id) => consumer.loadComponentFromModelImportIfNeeded(id))
         );
         componentsLegacy.push(...compsNewFromLane);
         newFromLaneAdded = true;
@@ -157,15 +162,26 @@ export class CheckoutMain {
         skipDependencyInstallation: checkoutProps.skipNpmInstall || leftUnresolvedConflicts,
         verbose: checkoutProps.verbose,
         resetConfig: checkoutProps.reset,
+        skipUpdatingBitMap: checkoutProps.skipUpdatingBitmap,
+        reasonForBitmapChange: 'checkout',
       };
       componentWriterResults = await this.componentWriter.writeMany(manyComponentsWriterOpts);
-      await deleteFilesIfNeeded(componentsResults, consumer);
     }
 
     const appliedVersionComponents = componentsResults.map((c) => c.applyVersionResult);
 
+    const componentIdsToRemove = allComponentsStatus
+      .filter((componentStatus) => componentStatus.shouldBeRemoved)
+      .map((c) => c.id.changeVersion(undefined));
+
+    if (componentIdsToRemove.length) {
+      await this.remove.removeLocallyByIds(componentIdsToRemove, { force: true });
+    }
+
     return {
       components: appliedVersionComponents,
+      removedComponents: componentIdsToRemove,
+      addedComponents,
       version,
       failedComponents,
       leftUnresolvedConflicts,
@@ -176,33 +192,60 @@ export class CheckoutMain {
     };
   }
 
-  async checkoutByCLIValues(
-    to: CheckoutTo,
-    componentPattern: string,
-    checkoutProps: CheckoutProps
-  ): Promise<ApplyVersionResults> {
-    this.logger.setStatusLine(BEFORE_CHECKOUT);
+  /**
+   * if .bitmap entry exists but the rootDir is missing from the filesystem, find the component in the scope and restore it.
+   * returns the restored component ids.
+   */
+  async restoreMissingComponents(checkoutProps: CheckoutProps): Promise<ComponentID[] | undefined> {
+    if (!checkoutProps.restoreMissingComponents) return undefined;
+    const ids = checkoutProps.ids || [];
+    const missing: ComponentID[] = [];
+    await Promise.all(
+      ids.map(async (id) => {
+        const bitMapEntry = this.workspace.bitMap.getBitmapEntry(id, { ignoreVersion: true });
+        if (bitMapEntry.noFilesError && bitMapEntry.noFilesError instanceof ComponentNotFoundInPath) {
+          delete bitMapEntry.noFilesError;
+          missing.push(id);
+        }
+      })
+    );
+    if (!missing.length) return undefined;
+    const comps = await this.workspace.scope.getMany(missing);
+    await this.componentWriter.writeMany({
+      components: comps.map((c) => c.state._consumer),
+      skipDependencyInstallation: true,
+      skipUpdatingBitMap: true,
+    });
+
+    return missing;
+  }
+
+  async checkoutByCLIValues(componentPattern: string, checkoutProps: CheckoutProps): Promise<ApplyVersionResults> {
+    const { revert, head } = checkoutProps;
+    this.logger.setStatusLine(revert ? 'reverting components...' : BEFORE_CHECKOUT);
     if (!this.workspace) throw new OutsideWorkspaceError();
     const consumer = this.workspace.consumer;
-    if (to === 'head') await this.makeLaneComponentsAvailableOnMain();
-    await this.parseValues(to, componentPattern, checkoutProps);
+    await this.importer.importCurrentObjects(); // important. among others, it fetches the remote lane object and its new components.
+    if (head) await this.makeLaneComponentsAvailableOnMain();
+    await this.parseValues(componentPattern, checkoutProps);
     const checkoutResults = await this.checkout(checkoutProps);
-    await consumer.onDestroy();
+    await consumer.onDestroy(`checkout (${componentPattern})`);
     return checkoutResults;
   }
 
   private async syncNewComponents({ ids, head }: CheckoutProps) {
     if (!head) return;
-    const notExported = ids?.filter((id) => !id._legacy.hasScope()).map((id) => id._legacy.changeScope(id.scope));
+    const notExported = ids?.filter((id) => !this.workspace.isExported(id)).map((id) => id.changeScope(id.scope));
     const scopeComponentsImporter = this.workspace.consumer.scope.scopeImporter;
     try {
-      await scopeComponentsImporter.importManyDeltaWithoutDeps({
-        ids: BitIds.fromArray(notExported || []),
-        fromHead: true,
+      await scopeComponentsImporter.importWithoutDeps(ComponentIdList.fromArray(notExported || []).toVersionLatest(), {
+        cache: false,
+        reason: 'for making sure the new components are really new and are not out-of-sync',
+        includeUnexported: true,
       });
     } catch (err) {
       // don't stop the process. it's possible that the scope doesn't exist yet because these are new components
-      this.logger.error(`unable to sync new components due to an error`, err);
+      this.logger.error(`unable to sync new components, if these components are really new, ignore the error`, err);
     }
   }
 
@@ -212,14 +255,7 @@ export class CheckoutMain {
     this.workspace.bitMap.makeComponentsAvailableOnMain(unavailableOnMain);
   }
 
-  private async parseValues(to: CheckoutTo, componentPattern: string, checkoutProps: CheckoutProps) {
-    if (to === HEAD) checkoutProps.head = true;
-    else if (to === LATEST) checkoutProps.latest = true;
-    else if (to === 'reset') checkoutProps.reset = true;
-    else {
-      if (!BitId.isValidVersion(to)) throw new BitError(`the specified version "${to}" is not a valid version`);
-      checkoutProps.version = to;
-    }
+  private async parseValues(componentPattern: string, checkoutProps: CheckoutProps) {
     if (checkoutProps.head && !componentPattern) {
       if (checkoutProps.all) {
         this.logger.console(`"--all" is deprecated for "bit checkout ${HEAD}", please omit it.`);
@@ -238,27 +274,41 @@ export class CheckoutMain {
     if (!componentPattern && !checkoutProps.all) {
       throw new GeneralError('please specify [component-pattern] or use --all flag');
     }
-    if (checkoutProps.entireLane && !checkoutProps.head) {
-      throw new BitError(`--entire-lane flag can only be used with "head" (bit checkout head --entire-lane)`);
+    if (checkoutProps.workspaceOnly && !checkoutProps.head) {
+      throw new BitError(`--workspace-only flag can only be used with "head" (bit checkout head --workspace-only)`);
     }
-    const idsOnWorkspace = componentPattern
-      ? await this.workspace.idsByPattern(componentPattern)
-      : await this.workspace.listIds();
+    if (checkoutProps.revert) {
+      checkoutProps.skipUpdatingBitmap = true;
+    }
+    if (checkoutProps.reset || checkoutProps.head) {
+      checkoutProps.includeLocallyDeleted = true;
+    }
+
+    const getIds = async () => {
+      if (componentPattern) {
+        return this.workspace.idsByPattern(componentPattern, true, {
+          includeDeleted: checkoutProps.includeLocallyDeleted,
+        });
+      }
+      return checkoutProps.includeLocallyDeleted ? this.workspace.listIdsIncludeRemoved() : this.workspace.listIds();
+    };
+
+    const idsOnWorkspace = await getIds();
+
     const currentLane = await this.workspace.consumer.getCurrentLaneObject();
     const currentLaneIds = currentLane?.toBitIds();
-    const ids = currentLaneIds
-      ? idsOnWorkspace.filter((id) => currentLaneIds.hasWithoutVersion(id._legacy))
-      : idsOnWorkspace;
+    const ids = currentLaneIds ? idsOnWorkspace.filter((id) => currentLaneIds.hasWithoutVersion(id)) : idsOnWorkspace;
     checkoutProps.ids = ids.map((id) => (checkoutProps.head || checkoutProps.latest ? id.changeVersion(LATEST) : id));
   }
 
   private async getNewComponentsFromLane(ids: ComponentID[]): Promise<ComponentID[]> {
+    // current lane object is up to date due to the previous `importCurrentObjects()` call
     const lane = await this.workspace.consumer.getCurrentLaneObject();
     if (!lane) {
       return [];
     }
     const laneBitIds = lane.toBitIds();
-    const newIds = laneBitIds.filter((bitId) => !ids.find((id) => id._legacy.isEqualWithoutVersion(bitId)));
+    const newIds = laneBitIds.filter((bitId) => !ids.find((id) => id.isEqualWithoutVersion(bitId)));
     const newComponentIds = await this.workspace.resolveMultipleComponentIds(newIds);
     const nonRemovedNewIds: ComponentID[] = [];
     await Promise.all(
@@ -270,73 +320,129 @@ export class CheckoutMain {
     return nonRemovedNewIds;
   }
 
+  // eslint-disable-next-line complexity
   private async getComponentStatusBeforeMergeAttempt(
-    component: ConsumerComponent,
+    id: ComponentID,
     checkoutProps: CheckoutProps
   ): Promise<ComponentStatusBeforeMergeAttempt> {
     const consumer = this.workspace.consumer;
-    const { version, head: headVersion, reset, latest: latestVersion } = checkoutProps;
+    const { version, head: headVersion, reset, revert, main, latest: latestVersion, versionPerId } = checkoutProps;
     const repo = consumer.scope.objects;
-    const componentModel = await consumer.scope.getModelComponentIfExist(component.id);
-    const componentStatus: ComponentStatus = { id: component.id };
+
+    let existingBitMapId = consumer.bitMap.getComponentIdIfExist(id, { ignoreVersion: true });
+    const getComponent = async () => {
+      try {
+        // TODO: check if we really need the { loadExtensions: true } here
+        const results = await consumer.loadComponents(ComponentIdList.fromArray([id]), undefined, {
+          loadExtensions: true,
+        });
+        if (results.components[0]) return results.components[0];
+        if (checkoutProps.includeLocallyDeleted && results.removedComponents[0]) {
+          return results.removedComponents[0];
+        }
+      } catch (err) {
+        if (checkoutProps.allowAddingComponentsFromScope && !existingBitMapId) return undefined;
+        throw err;
+      }
+      return undefined;
+    };
+    const component = await getComponent();
+    if (component) {
+      // the component might fix an out-of-sync issue and as a result, the id has changed
+      id = component.id;
+      existingBitMapId = consumer.bitMap.getComponentIdIfExist(id, { ignoreVersion: true });
+    }
+
+    const componentModel = await consumer.scope.getModelComponentIfExist(id);
+    const componentStatus: ComponentStatusBeforeMergeAttempt = { id };
     const returnFailure = (msg: string, unchangedLegitimately = false) => {
-      componentStatus.failureMessage = msg;
+      componentStatus.unchangedMessage = msg;
       componentStatus.unchangedLegitimately = unchangedLegitimately;
       return componentStatus;
     };
     if (!componentModel) {
-      return returnFailure(`component ${component.id.toString()} is new, no version to checkout`, true);
+      return returnFailure(`component ${id.toString()} is new, no version to checkout`, true);
     }
-    const unmerged = repo.unmergedComponents.getEntry(component.name);
+    if (main && !componentModel.head) {
+      return returnFailure(`component ${id.toString()} is not available on main`);
+    }
+    const unmerged = repo.unmergedComponents.getEntry(id);
     if (!reset && unmerged) {
       return returnFailure(
-        `component ${component.id.toStringWithoutVersion()} is in during-merge state, please snap/tag it first (or use bit merge --resolve/--abort)`
+        `component ${id.toStringWithoutVersion()} is in during-merge state, please snap/tag it first (or use bit merge --resolve/--abort)`
       );
     }
-    const getNewVersion = async (): Promise<string> => {
-      if (reset) return component.id.version as string;
 
+    const getNewVersion = async (): Promise<string> => {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      if (reset) return component!.id.version as string;
       if (headVersion) return componentModel.headIncludeRemote(repo);
-      if (latestVersion) return componentModel.latestVersion();
-      // @ts-ignore if !reset the version is defined
-      return version;
+      // we verified previously that head exists in case of "main"
+      if (main) return componentModel.head?.toString() as string;
+      if (latestVersion) {
+        const latest = componentModel.latestVersionIfExist();
+        return latest || componentModel.headIncludeRemote(repo);
+      }
+      if (versionPerId) {
+        return versionPerId.find((bitId) => bitId.isEqualWithoutVersion(id))?.version as string;
+      }
+
+      // if all above are false, the version is defined
+      return version as string;
     };
     const newVersion = await getNewVersion();
     if (version && !headVersion) {
       const hasVersion = await componentModel.hasVersion(version, repo);
-      if (!hasVersion)
-        return returnFailure(`component ${component.id.toStringWithoutVersion()} doesn't have version ${version}`);
+      if (!hasVersion) return returnFailure(`component ${id.toStringWithoutVersion()} doesn't have version ${version}`);
     }
-    const existingBitMapId = consumer.bitMap.getBitId(component.id, { ignoreVersion: true });
-    const currentlyUsedVersion = existingBitMapId.version;
-    if (!currentlyUsedVersion) {
-      return returnFailure(`component ${component.id.toStringWithoutVersion()} is new`);
+    const currentlyUsedVersion = existingBitMapId?.version;
+    if (existingBitMapId && !currentlyUsedVersion) {
+      return returnFailure(`component ${id.toStringWithoutVersion()} is new`);
     }
     if (version && currentlyUsedVersion === version) {
       // it won't be relevant for 'reset' as it doesn't have a version
-      return returnFailure(`component ${component.id.toStringWithoutVersion()} is already at version ${version}`, true);
+      return returnFailure(`component ${id.toStringWithoutVersion()} is already at version ${version}`, true);
     }
     if (headVersion && currentlyUsedVersion === newVersion) {
       return returnFailure(
-        `component ${component.id.toStringWithoutVersion()} is already at the latest version, which is ${newVersion}`,
+        `component ${id.toStringWithoutVersion()} is already at the latest version, which is ${newVersion}`,
         true
       );
     }
-    const currentVersionObject: Version = await componentModel.loadVersion(currentlyUsedVersion, repo);
-    const isModified = await consumer.isComponentModified(currentVersionObject, component);
-    if (!isModified && reset) {
-      return returnFailure(`component ${component.id.toStringWithoutVersion()} is not modified`, true);
+    if (!reset) {
+      const divergeDataForMergePending = await componentModel.getDivergeDataForMergePending(repo);
+      const isMergePending = divergeDataForMergePending.isDiverged();
+      if (isMergePending) {
+        return returnFailure(`component is merge-pending and cannot be checked out, run "bit status" for more info`);
+      }
+    }
+    let isModified = false;
+    if (currentlyUsedVersion) {
+      const currentVersionObject: Version = await componentModel.loadVersion(currentlyUsedVersion, repo);
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      isModified = await consumer.isComponentModified(currentVersionObject, component!);
+      const isRemoved = component && component.isRemoved();
+      if (!isModified && !isRemoved && reset) {
+        return returnFailure(`component ${id.toStringWithoutVersion()} is not modified`, true);
+      }
     }
 
     const versionRef = componentModel.getRef(newVersion);
     if (!versionRef) throw new Error(`unable to get ref ${newVersion} from ${componentModel.id()}`);
-    const componentVersion = (await consumer.scope.getObject(versionRef.hash)) as Version;
-    const newId = component.id.changeVersion(newVersion);
+    const componentVersion = (await consumer.scope.getObject(versionRef.hash)) as Version | undefined;
+    if (componentVersion?.isRemoved()) {
+      if (existingBitMapId) componentStatus.shouldBeRemoved = true;
+      return returnFailure(`component has been removed`, true);
+    }
 
-    if (reset || !isModified) {
+    const newId = id.changeVersion(newVersion);
+
+    if (reset || !isModified || revert || !currentlyUsedVersion) {
       // if the component is not modified, no need to try merge the files, they will be written later on according to the
       // checked out version. same thing when no version is specified, it'll be reset to the model-version later.
-      return { componentFromFS: component, componentFromModel: componentVersion, id: newId };
+
+      // if !currentlyUsedVersion it only exists in the model, so just write it. (happening during bit-switch/bit-lane-import)
+      return { currentComponent: component, componentFromModel: componentVersion, id: newId };
     }
 
     const propsForMerge = {
@@ -344,11 +450,11 @@ export class CheckoutMain {
       componentModel,
     };
 
-    return { componentFromFS: component, componentFromModel: componentVersion, id: newId, propsForMerge };
+    return { currentComponent: component, componentFromModel: componentVersion, id: newId, propsForMerge };
   }
 
   private async getMergeStatus({
-    componentFromFS,
+    currentComponent: componentFromFS,
     componentFromModel,
     id,
     propsForMerge,
@@ -380,23 +486,25 @@ export class CheckoutMain {
       baseComponent,
     });
 
-    return { componentFromFS, componentFromModel, id, mergeResults };
+    return { currentComponent: componentFromFS, componentFromModel, id, mergeResults };
   }
 
   static slots = [];
-  static dependencies = [CLIAspect, WorkspaceAspect, LoggerAspect, ComponentWriterAspect];
+  static dependencies = [CLIAspect, WorkspaceAspect, LoggerAspect, ComponentWriterAspect, ImporterAspect, RemoveAspect];
 
   static runtime = MainRuntime;
 
-  static async provider([cli, workspace, loggerMain, compWriter]: [
+  static async provider([cli, workspace, loggerMain, compWriter, importer, remove]: [
     CLIMain,
     Workspace,
     LoggerMain,
-    ComponentWriterMain
+    ComponentWriterMain,
+    ImporterMain,
+    RemoveMain
   ]) {
     const logger = loggerMain.createLogger(CheckoutAspect.id);
-    const checkoutMain = new CheckoutMain(workspace, logger, compWriter);
-    cli.register(new CheckoutCmd(checkoutMain));
+    const checkoutMain = new CheckoutMain(workspace, logger, compWriter, importer, remove);
+    cli.register(new CheckoutCmd(checkoutMain), new RevertCmd(checkoutMain));
     return checkoutMain;
   }
 }

@@ -1,7 +1,7 @@
 import chai, { expect } from 'chai';
 import fs from 'fs-extra';
 import path from 'path';
-import { HASH_SIZE, AUTO_SNAPPED_MSG } from '../../src/constants';
+import { HASH_SIZE, AUTO_SNAPPED_MSG, FILE_CHANGES_CHECKOUT_MSG } from '../../src/constants';
 import ComponentsPendingMerge from '../../src/consumer/component-ops/exceptions/components-pending-merge';
 import Helper from '../../src/e2e-helper/e2e-helper';
 import * as fixtures from '../../src/fixtures/fixtures';
@@ -119,7 +119,7 @@ describe('bit snap command', function () {
     });
     describe('untag the head snap', () => {
       before(() => {
-        helper.command.untag(`bar/foo`, true);
+        helper.command.reset(`bar/foo`, true);
       });
       it('should change the head to the first snap', () => {
         const compAfterUntag = helper.command.catComponent('bar/foo');
@@ -263,10 +263,10 @@ describe('bit snap command', function () {
         describe('without --no-snap flag', () => {
           let mergeOutput;
           before(() => {
-            mergeOutput = helper.command.merge('bar/foo --ours');
+            mergeOutput = helper.command.merge('bar/foo --auto-merge-resolve ours');
           });
           it('should succeed and indicate that the files were not changed', () => {
-            expect(mergeOutput).to.have.string('unchanged');
+            expect(mergeOutput).to.not.have.string(FILE_CHANGES_CHECKOUT_MSG);
           });
           it('should indicate that a component was snapped', () => {
             expect(mergeOutput).to.have.string('merge-snapped components');
@@ -295,10 +295,10 @@ describe('bit snap command', function () {
           let mergeOutput;
           before(() => {
             helper.scopeHelper.getClonedLocalScope(beforeMergeScope);
-            mergeOutput = helper.command.merge('bar/foo --ours --no-snap');
+            mergeOutput = helper.command.merge('bar/foo --auto-merge-resolve ours --no-snap');
           });
           it('should succeed and indicate that the files were not changed', () => {
-            expect(mergeOutput).to.have.string('unchanged');
+            expect(mergeOutput).to.not.have.string(FILE_CHANGES_CHECKOUT_MSG);
           });
           it('should not show a message about merge-snapped components', () => {
             expect(mergeOutput).to.not.have.string('merge-snapped components');
@@ -352,7 +352,7 @@ describe('bit snap command', function () {
         before(() => {
           helper.scopeHelper.getClonedLocalScope(localScope);
           helper.command.importComponent('bar/foo --objects');
-          mergeOutput = helper.command.merge('bar/foo --theirs');
+          mergeOutput = helper.command.merge('bar/foo --auto-merge-resolve theirs');
         });
         it('should succeed and indicate that the files were updated', () => {
           expect(mergeOutput).to.have.string('updated');
@@ -383,7 +383,7 @@ describe('bit snap command', function () {
         before(() => {
           helper.scopeHelper.getClonedLocalScope(localScope);
           helper.command.importComponent('bar/foo --objects');
-          mergeOutput = helper.command.merge('bar/foo --manual');
+          mergeOutput = helper.command.merge('bar/foo --auto-merge-resolve manual');
           scopeWithConflicts = helper.scopeHelper.cloneLocalScope();
         });
         it('should succeed and indicate that the files were left in a conflict state', () => {
@@ -404,16 +404,17 @@ describe('bit snap command', function () {
           const head = helper.command.getHead('bar/foo');
           expect(head).to.equal(localHead);
         });
-        it('bit status should show it as component with conflict and not as pending update or modified', () => {
+        it('bit status should show it as component with conflict and modified but not as pending update', () => {
           const status = helper.command.statusJson();
           expect(status.componentsDuringMergeState).to.have.lengthOf(1);
-          expect(status.modifiedComponents).to.have.lengthOf(0);
+          expect(status.modifiedComponents).to.have.lengthOf(1);
           expect(status.outdatedComponents).to.have.lengthOf(0);
           expect(status.mergePendingComponents).to.have.lengthOf(0);
         });
         it('should block checking out the component', () => {
-          const output = helper.command.checkoutVersion(firstSnap, 'bar/foo', '--manual');
-          expect(output).to.have.string('is in during-merge state');
+          expect(() => helper.command.checkoutVersion(firstSnap, 'bar/foo', '--auto-merge-resolve manual')).to.throw(
+            'is in during-merge state'
+          );
         });
         describe('tagging or snapping the component', () => {
           beforeEach(() => {
@@ -464,7 +465,7 @@ describe('bit snap command', function () {
             helper.scopeHelper.getClonedLocalScope(scopeWithConflicts);
             // change it so the file would be valid without conflicts marks
             helper.fixtures.createComponentBarFoo('');
-            helper.command.untag('bar/foo');
+            helper.command.reset('bar/foo');
           });
           it('bit status should not show the component as a component with conflicts but as modified', () => {
             const status = helper.command.statusJson();
@@ -588,7 +589,7 @@ describe('bit snap command', function () {
       helper.fs.outputFile('comp3/index.js', fixtures.comp3V2);
 
       const statusOutput = helper.command.runCmd('bit status');
-      expect(statusOutput).to.have.string('components pending to be tagged automatically');
+      expect(statusOutput).to.have.string('components pending auto-tag');
 
       snapOutput = helper.command.snapComponent('comp3');
       isTypeHead = helper.command.getHead('comp3');
@@ -601,7 +602,11 @@ describe('bit snap command', function () {
       expect(comp2.dependencies[0].id.name).to.equal('comp3');
       expect(comp2.dependencies[0].id.version).to.equal(isTypeHead);
 
-      expect(comp2.flattenedDependencies).to.deep.include({ name: 'comp3', version: isTypeHead });
+      expect(comp2.flattenedDependencies).to.deep.include({
+        name: 'comp3',
+        scope: helper.scopes.remote,
+        version: isTypeHead,
+      });
     });
     it('should update the dependencies and the flattenedDependencies of the dependent of the dependent with the new versions', () => {
       const comp1 = helper.command.catComponent('comp1@latest');
@@ -609,8 +614,16 @@ describe('bit snap command', function () {
       expect(comp1.dependencies[0].id.name).to.equal('comp2');
       expect(comp1.dependencies[0].id.version).to.equal(isStringHead);
 
-      expect(comp1.flattenedDependencies).to.deep.include({ name: 'comp3', version: isTypeHead });
-      expect(comp1.flattenedDependencies).to.deep.include({ name: 'comp2', version: isStringHead });
+      expect(comp1.flattenedDependencies).to.deep.include({
+        name: 'comp3',
+        scope: helper.scopes.remote,
+        version: isTypeHead,
+      });
+      expect(comp1.flattenedDependencies).to.deep.include({
+        name: 'comp2',
+        scope: helper.scopes.remote,
+        version: isStringHead,
+      });
     });
     it('bit-status should show them all as staged and not modified', () => {
       const status = helper.command.statusJson();
@@ -704,7 +717,7 @@ describe('bit snap command', function () {
       });
       describe('reset all local versions', () => {
         before(() => {
-          helper.command.untagAll();
+          helper.command.resetAll();
         });
         it('should change the head to point to the parent of the untagged version not to the remote head', () => {
           const head = helper.command.getHead('comp1');
@@ -722,7 +735,7 @@ describe('bit snap command', function () {
       describe('reset only head', () => {
         before(() => {
           helper.scopeHelper.getClonedLocalScope(beforeUntag);
-          helper.command.untagAll('--head');
+          helper.command.resetAll('--head');
         });
         it('should change the head to point to the parent of the head and not to the remote head', () => {
           const head = helper.command.getHead('comp1');
@@ -740,11 +753,14 @@ describe('bit snap command', function () {
       helper.fixtures.populateComponents(1, undefined);
       helper.command.snapAllComponentsWithoutBuild();
       helper.command.export();
-      helper.command.removeComponent('comp1', '--soft');
+      helper.command.softRemoveComponent('comp1');
       output = helper.command.snapAllComponentsWithoutBuild('--unmodified');
     });
-    it('should indicate that the component was snapped successfully', () => {
-      expect(output).to.have.string('changed components');
+    it('should indicate that the component was removed successfully', () => {
+      expect(output).to.have.string('removed components');
+    });
+    it('should not show the component as changed (because the new snap isnt relevant for a deleted component', () => {
+      expect(output).to.not.have.string('changed components');
     });
   });
 });

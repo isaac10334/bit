@@ -12,9 +12,9 @@ import {
   ResolvedPackageVersion,
 } from '@teambit/dependency-resolver';
 import { BitError } from '@teambit/bit-error';
-import { ComponentMap, Component } from '@teambit/component';
+import { ComponentMap } from '@teambit/component';
 import fs from 'fs-extra';
-import { join, relative, resolve } from 'path';
+import { join, relative } from 'path';
 import {
   Workspace,
   Project,
@@ -30,29 +30,41 @@ import {
 } from '@yarnpkg/core';
 import { getPluginConfiguration } from '@yarnpkg/cli';
 import { npath, PortablePath } from '@yarnpkg/fslib';
-import { Resolution } from '@yarnpkg/parsers';
+import { parseSyml, stringifySyml, Resolution } from '@yarnpkg/parsers';
 import npmPlugin from '@yarnpkg/plugin-npm';
 import { parseOverrides } from '@pnpm/parse-overrides';
 import { ProjectManifest } from '@pnpm/types';
-import { omit, mapValues } from 'lodash';
-import userHome from 'user-home';
+import { omit, mapValues, pickBy } from 'lodash';
+import { homedir } from 'os';
 import { Logger } from '@teambit/logger';
 import versionSelectorType from 'version-selector-type';
 import YAML from 'yaml';
+import { createLinks } from '@teambit/dependencies.fs.linked-dependencies';
+import symlinkDir from 'symlink-dir';
 import { createRootComponentsDir } from './create-root-components-dir';
 
-type BackupJsons = {
-  [path: string]: Buffer | undefined;
-};
-
 export class YarnPackageManager implements PackageManager {
+  readonly name = 'yarn';
+
   constructor(private depResolver: DependencyResolverMain, private logger: Logger) {}
 
   async install(
     { rootDir, manifests, componentDirectoryMap }: InstallationContext,
     installOptions: PackageManagerInstallOptions = {}
-  ): Promise<void> {
+  ): Promise<{ dependenciesChanged: boolean }> {
     this.logger.setStatusLine('installing dependencies');
+    if (installOptions.useNesting && installOptions.rootComponentsForCapsules) {
+      // For some reason Yarn doesn't want to link core aspects to the capsules root directory,
+      // because the capsule root directory is outside the workspace's root directory.
+      // So we need to create the symlinks ourselves.
+      const [capsulesRoot, capsulesRootManifest] =
+        Object.entries(manifests).find(([path]) => {
+          return rootDir.startsWith(path) && rootDir !== path;
+        }) ?? [];
+      if (capsulesRoot && capsulesRootManifest?.dependencies) {
+        await createLinks(capsulesRoot, capsulesRootManifest.dependencies);
+      }
+    }
 
     const rootDirPath = npath.toPortablePath(rootDir);
     const config = await this.computeConfiguration(rootDirPath, {
@@ -74,7 +86,13 @@ export class YarnPackageManager implements PackageManager {
     }
     const workspaceManifest = manifests[rootDir];
     manifests = omit(manifests, rootDir);
-    const rootWs = await this.createWorkspace(rootDir, project, workspaceManifest, installOptions.overrides);
+    const rootWs = await this.createWorkspace({
+      rootDir,
+      project,
+      manifest: workspaceManifest,
+      overrides: installOptions.overrides,
+      neverBuiltDependencies: installOptions.neverBuiltDependencies,
+    });
     if (installOptions.rootComponents) {
       rootWs.manifest.installConfig = {
         hoistingLimits: 'dependencies',
@@ -91,7 +109,6 @@ export class YarnPackageManager implements PackageManager {
         ...manifest,
         dependencies: {
           ...manifest.peerDependencies,
-          ...manifest['defaultPeerDependencies'], // eslint-disable-line
           ...manifest.dependencies,
         },
       }));
@@ -102,7 +119,6 @@ export class YarnPackageManager implements PackageManager {
       // so we make runtime dependencies from peer dependencies.
       manifests[rootDir].dependencies = {
         ...manifests[rootDir].peerDependencies,
-        ...manifests[rootDir]['defaultPeerDependencies'], // eslint-disable-line
         ...manifests[rootDir].dependencies,
       };
     } else if (installOptions.rootComponentsForCapsules) {
@@ -117,7 +133,7 @@ export class YarnPackageManager implements PackageManager {
 
     const workspacesP = Object.keys(manifests).map(async (path) => {
       const manifest = manifests[path];
-      const workspace = await this.createWorkspace(path, project, manifest);
+      const workspace = await this.createWorkspace({ rootDir: path, project, manifest });
       return workspace;
     });
 
@@ -143,7 +159,6 @@ export class YarnPackageManager implements PackageManager {
     this.setupWorkspaces(project, workspaces);
 
     const cache = await Cache.find(config);
-    // const existingPackageJsons = await this.backupPackageJsons(rootDir, componentDirectoryMap);
 
     const installReport = await StreamReport.start(
       {
@@ -157,17 +172,24 @@ export class YarnPackageManager implements PackageManager {
           report,
         });
         await project.persistLockfile();
+        await removeExternalLinksFromYarnLockfile(rootDir);
       }
     );
 
-    // TODO: check if package.json and link files generation can be prevented through the yarn API or
-    // mock the files by hooking to `xfs`.
-    // see the persistProject: false above
-    // await this.restorePackageJsons(existingPackageJsons);
+    if (installOptions.nmSelfReferences) {
+      await Promise.all(
+        Object.entries(manifests).map(async ([dir, manifest]) => {
+          if (manifest.name) {
+            await symlinkDir(dir, join(dir, 'node_modules', manifest.name));
+          }
+        })
+      );
+    }
 
     if (installReport.hasErrors()) process.exit(installReport.exitCode());
 
     this.logger.consoleSuccess('installing dependencies');
+    return { dependenciesChanged: true };
   }
 
   /**
@@ -186,78 +208,38 @@ export class YarnPackageManager implements PackageManager {
     return overrides;
   }
 
-  private getPackageJsonPath(dir: string): string {
-    const packageJsonPath = join(dir, 'package.json');
-    return packageJsonPath;
-  }
-
-  private async backupPackageJsons(rootDir: string, componentDirectoryMap: ComponentMap<string>): Promise<BackupJsons> {
-    const result: BackupJsons = {};
-    const rootPackageJsonPath = this.getPackageJsonPath(rootDir);
-    result[rootPackageJsonPath] = await this.getFileToBackup(rootPackageJsonPath);
-    const componentsBackupsP = componentDirectoryMap.toArray().map(async ([component, dir]) => {
-      const { packageJsonPath, file } = await this.getComponentPackageJsonToBackup(component, dir);
-      result[packageJsonPath] = file;
-    });
-    await Promise.all(componentsBackupsP);
-    return result;
-  }
-
-  private async restorePackageJsons(backupJsons: BackupJsons): Promise<void | undefined> {
-    const promises = Object.entries(backupJsons).map(async ([packageJsonPath, file]) => {
-      const exists = await fs.pathExists(packageJsonPath);
-      // if there is no backup it means it wasn't there before and should be deleted
-      if (!file) {
-        if (exists) {
-          return fs.remove(packageJsonPath);
-        }
-        return undefined;
-      }
-      return fs.writeFile(packageJsonPath, file);
-    });
-    await Promise.all(promises);
-  }
-
-  private async getFileToBackup(packageJsonPath: string): Promise<Buffer | undefined> {
-    const exists = await fs.pathExists(packageJsonPath);
-    if (!exists) {
-      return undefined;
-    }
-    const existingFile = await fs.readFile(packageJsonPath);
-    return existingFile;
-  }
-
-  private async getComponentPackageJsonToBackup(
-    component: Component,
-    dir: string
-  ): Promise<{ packageJsonPath: string; file: Buffer | undefined }> {
-    const packageJsonPath = resolve(join(dir, 'package.json'));
-    const result = {
-      packageJsonPath,
-      file: await this.getFileToBackup(packageJsonPath),
-    };
-    return result;
-  }
-
-  private async createWorkspace(rootDir: string, project: Project, manifest: any, overrides?: Record<string, string>) {
+  private async createWorkspace({
+    rootDir,
+    project,
+    manifest,
+    overrides,
+    neverBuiltDependencies,
+  }: {
+    rootDir: string;
+    project: Project;
+    manifest: any;
+    overrides?: Record<string, string>;
+    neverBuiltDependencies?: string[];
+  }) {
     const wsPath = npath.toPortablePath(rootDir);
     const name = manifest.name || 'workspace';
 
     const ws = new Workspace(wsPath, { project });
     await ws.setup();
     const identity = structUtils.parseIdent(name);
-    // const needOverrideInternal = !!ws.manifest.name && !!manifest.name;
     ws.manifest.name = identity;
     ws.manifest.version = manifest.version;
     ws.manifest.dependencies = this.computeDeps(manifest.dependencies);
     ws.manifest.devDependencies = this.computeDeps(manifest.devDependencies);
     ws.manifest.peerDependencies = this.computeDeps(manifest.peerDependencies);
     ws.manifest.installConfig = manifest.installConfig;
+    if (neverBuiltDependencies) {
+      const disableBuild = new Map([[null, { built: false }]]);
+      ws.manifest.dependenciesMeta = new Map(neverBuiltDependencies.map((dep) => [dep, disableBuild]));
+    }
     if (overrides) {
       ws.manifest.resolutions = convertOverridesToResolutions(overrides);
     }
-
-    // if (needOverrideInternal) this.overrideInternalWorkspaceParams(ws);
 
     return ws;
   }
@@ -339,7 +321,7 @@ export class YarnPackageManager implements PackageManager {
     return undefined;
   }
 
-  private getGlobalFolder(baseDir: string = userHome) {
+  private getGlobalFolder(baseDir: string = homedir()) {
     return `${baseDir}/.yarn/global`;
   }
 
@@ -375,12 +357,13 @@ export class YarnPackageManager implements PackageManager {
     const defaultAuthProp = this.getAuthProp(defaultRegistry);
 
     const globalFolder = this.getGlobalFolder(options.cacheRootDir);
+    const cacheFolder = join(globalFolder, 'cache');
     const data = {
       enableGlobalCache: true,
       nodeLinker: options.nodeLinker === 'isolated' ? 'pnpm' : 'node-modules',
       installStatePath: `${rootDirPath}/.yarn/install-state.gz`,
       pnpUnpluggedFolder: `${rootDirPath}/.yarn/unplugged`,
-      cacheFolder: join(globalFolder, 'cache'),
+      cacheFolder,
       pnpDataPath: `${rootDirPath}/.pnp.meta.json`,
       npmScopes: scopedRegistries,
       virtualFolder: `${rootDirPath}/.yarn/__virtual__`,
@@ -409,6 +392,10 @@ export class YarnPackageManager implements PackageManager {
     }
     // TODO: node-modules is hardcoded now until adding support for pnp.
     config.use('<bit>', data, rootDirPath, { overwrite: true });
+
+    // Yarn  v4 stopped automatically creating the cache folder.
+    // If we don't do it ourselves, Yarn will fail with: "ENOENT: no such file or directory, copyfile..."
+    await fs.mkdir(cacheFolder, { recursive: true });
 
     return config;
   }
@@ -561,7 +548,6 @@ async function updateManifestsForInstallationInWorkspaceCapsules(manifests: { [k
       );
       manifest.dependencies = {
         ...manifest.peerDependencies,
-        ...manifest.defaultPeerDependencies,
         ...manifest.dependencies,
       };
       manifest.installConfig = {
@@ -569,4 +555,24 @@ async function updateManifestsForInstallationInWorkspaceCapsules(manifests: { [k
       };
     })
   );
+}
+
+async function removeExternalLinksFromYarnLockfile(lockfileLocation: string) {
+  const yarnLockPath = join(lockfileLocation, 'yarn.lock');
+  const lockfileObject = parseSyml(await fs.readFile(yarnLockPath, 'utf-8'));
+  const updatedLockfile = pickBy(lockfileObject, (_, key) => !key.startsWith('@teambit') || !key.includes('@link:'));
+  const rootWorkspace = Object.entries(updatedLockfile).find(([key]) => key.endsWith('workspace:.'));
+  if (rootWorkspace?.[1]) {
+    rootWorkspace[1].dependencies = Object.fromEntries(
+      Object.entries(rootWorkspace[1].dependencies).filter(
+        ([key, value]) => !key.startsWith('@teambit') || !(value as string).startsWith('link:')
+      )
+    );
+  }
+  const header = `${[
+    `# This file is generated by running "yarn install" inside your project.\n`,
+    `# Manual changes might be lost - proceed with caution!\n`,
+  ].join(``)}\n`;
+  const lockfileContent = header + stringifySyml(updatedLockfile);
+  await fs.writeFile(yarnLockPath, lockfileContent, 'utf-8');
 }

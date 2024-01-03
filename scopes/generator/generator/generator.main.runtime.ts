@@ -2,36 +2,43 @@ import { GraphqlAspect, GraphqlMain } from '@teambit/graphql';
 import { CLIAspect, CLIMain, MainRuntime } from '@teambit/cli';
 import WorkspaceAspect, { OutsideWorkspaceError, Workspace } from '@teambit/workspace';
 import { EnvDefinition, EnvsAspect, EnvsMain } from '@teambit/envs';
-import { CommunityAspect } from '@teambit/community';
-import type { CommunityMain } from '@teambit/community';
+import ComponentConfig from '@teambit/legacy/dist/consumer/config';
+import WorkspaceConfigFilesAspect, { WorkspaceConfigFilesMain } from '@teambit/workspace-config-files';
 
 import ComponentAspect, { ComponentID } from '@teambit/component';
 import type { ComponentMain, Component } from '@teambit/component';
 
-import { isCoreAspect, loadBit } from '@teambit/bit';
+import { isCoreAspect, loadBit, restoreGlobals } from '@teambit/bit';
 import { Slot, SlotRegistry } from '@teambit/harmony';
+import GitAspect, { GitMain } from '@teambit/git';
 import { BitError } from '@teambit/bit-error';
 import AspectLoaderAspect, { AspectLoaderMain } from '@teambit/aspect-loader';
 import TrackerAspect, { TrackerMain } from '@teambit/tracker';
 import NewComponentHelperAspect, { NewComponentHelperMain } from '@teambit/new-component-helper';
 import { compact } from 'lodash';
+import { Logger, LoggerAspect, LoggerMain } from '@teambit/logger';
 import { ComponentTemplate } from './component-template';
 import { GeneratorAspect } from './generator.aspect';
 import { CreateCmd, CreateOptions } from './create.cmd';
 import { TemplatesCmd } from './templates.cmd';
 import { generatorSchema } from './generator.graphql';
-import { ComponentGenerator, GenerateResult } from './component-generator';
+import { ComponentGenerator, GenerateResult, OnComponentCreateFn } from './component-generator';
 import { WorkspaceGenerator } from './workspace-generator';
 import { WorkspaceTemplate } from './workspace-template';
 import { NewCmd, NewOptions } from './new.cmd';
-import { componentGeneratorTemplate } from './templates/component-generator';
-import { workspaceGeneratorTemplate } from './templates/workspace-generator';
-import { starterTemplate } from './templates/starter';
+import {
+  componentGeneratorTemplate,
+  componentGeneratorTemplateStandalone,
+  starterTemplate,
+  starterTemplateStandalone,
+} from './templates';
+import { BasicWorkspaceStarter } from './templates/basic';
 import { StarterPlugin } from './starter.plugin';
 import { GeneratorService } from './generator.service';
 
 export type ComponentTemplateSlot = SlotRegistry<ComponentTemplate[]>;
 export type WorkspaceTemplateSlot = SlotRegistry<WorkspaceTemplate[]>;
+export type OnComponentCreateSlot = SlotRegistry<OnComponentCreateFn>;
 
 export type TemplateDescriptor = {
   aspectId: string;
@@ -71,13 +78,17 @@ export class GeneratorMain {
   constructor(
     private componentTemplateSlot: ComponentTemplateSlot,
     private workspaceTemplateSlot: WorkspaceTemplateSlot,
+    private onComponentCreateSlot: OnComponentCreateSlot,
     private config: GeneratorConfig,
     private workspace: Workspace,
     private envs: EnvsMain,
     private aspectLoader: AspectLoaderMain,
     private newComponentHelper: NewComponentHelperMain,
     private componentAspect: ComponentMain,
-    private tracker: TrackerMain
+    private tracker: TrackerMain,
+    private logger: Logger,
+    private git: GitMain,
+    private wsConfigFiles: WorkspaceConfigFilesMain
   ) {}
 
   /**
@@ -89,10 +100,15 @@ export class GeneratorMain {
   }
 
   /**
-   * register a new component template.
+   * register a new workspace starter.
    */
   registerWorkspaceTemplate(templates: WorkspaceTemplate[]) {
     this.workspaceTemplateSlot.register(templates);
+    return this;
+  }
+
+  registerOnComponentCreate(fn: OnComponentCreateFn) {
+    this.onComponentCreateSlot.register(fn);
     return this;
   }
 
@@ -143,7 +159,7 @@ export class GeneratorMain {
    * returns a specific component template.
    */
   async getComponentTemplate(name: string, aspectId?: string): Promise<ComponentTemplateWithId | undefined> {
-    const fromEnv = await this.listEnvComponentTemplates();
+    const fromEnv = await this.listEnvComponentTemplates([], aspectId);
     if (fromEnv && fromEnv.length) {
       const found = this.findTemplateByAspectIdAndName<ComponentTemplateWithId>(aspectId, name, fromEnv);
       if (found) return found;
@@ -161,25 +177,43 @@ export class GeneratorMain {
   ): T | undefined {
     // @ts-ignore (should set T to be extends ComponentTemplateWithId or WorkspaceTemplateWithId)
     const found = templates.find(({ id, template }) => {
-      if (aspectId && id !== aspectId) return false;
+      // When doing something like:
+      // bit create react-env my-env --aspect teambit.react/react-env
+      // we will get the aspectId without version
+      // but the env might be loaded from the global scope then it will be with a version
+      // so it won't found if we don't look for it like this
+      const idWithoutVersion = id.split('@')[0];
+      if (aspectId && id !== aspectId && idWithoutVersion !== aspectId) return false;
       return template.name === name;
     });
     return found;
   }
 
   /**
-   * in the case the aspect-id is given and this aspect doesn't exist locally, import it to the
-   * global scope and load it from the capsule
+   * Get the generator aspect and the envs aspect from an harmony instance of the global scope
    */
-  async findTemplateInGlobalScope(
-    aspectId: string,
-    name?: string
-  ): Promise<{ workspaceTemplate?: WorkspaceTemplate; aspect?: Component }> {
+  private async getGlobalGeneratorEnvs(
+    aspectId: string
+  ): Promise<{ remoteGenerator: GeneratorMain; fullAspectId: string; remoteEnvsAspect: EnvsMain; aspect: any }> {
     const { globalScopeHarmony, components } = await this.aspectLoader.loadAspectsFromGlobalScope([aspectId]);
     const remoteGenerator = globalScopeHarmony.get<GeneratorMain>(GeneratorAspect.id);
     const remoteEnvsAspect = globalScopeHarmony.get<EnvsMain>(EnvsAspect.id);
     const aspect = components[0];
     const fullAspectId = aspect.id.toString();
+    restoreGlobals();
+
+    return { remoteGenerator, fullAspectId, remoteEnvsAspect, aspect };
+  }
+
+  /**
+   * in the case the aspect-id is given and this aspect doesn't exist locally, import it to the
+   * global scope and load it from the capsule
+   */
+  async findWorkspaceTemplateInGlobalScope(
+    aspectId: string,
+    name?: string
+  ): Promise<{ workspaceTemplate?: WorkspaceTemplate; aspect?: Component }> {
+    const { remoteGenerator, fullAspectId, remoteEnvsAspect, aspect } = await this.getGlobalGeneratorEnvs(aspectId);
     const fromGlobal = await remoteGenerator.searchRegisteredWorkspaceTemplate.call(
       remoteGenerator,
       name,
@@ -222,14 +256,18 @@ export class GeneratorMain {
       return { workspaceTemplate: registeredTemplate };
     }
     if (!aspectId) {
-      throw new BitError(`template "${name}" was not found, if this is a custom-template, please use --aspect flag`);
+      throw new BitError(
+        `template "${name}" was not found, please use --aspect flag to load from an env i.e --aspect teambit.react/react-env\n Learn more about component templates here: https://bit.dev/reference/generator/create-generator`
+      );
     }
 
-    const { workspaceTemplate, aspect } = await this.findTemplateInGlobalScope(aspectId, name);
+    const { workspaceTemplate, aspect } = await this.findWorkspaceTemplateInGlobalScope(aspectId, name);
     if (workspaceTemplate) {
       return { workspaceTemplate, aspect };
     }
-    throw new BitError(`template "${name}" was not found`);
+    throw new BitError(
+      `template "${name}" was not found, please use --aspect flag to load from an env i.e --aspect teambit.react/react-env\n Learn more about component templates here: https://bit.dev/reference/generator/create-generator`
+    );
   }
 
   async searchRegisteredWorkspaceTemplate(
@@ -256,17 +294,25 @@ export class GeneratorMain {
   async generateComponentTemplate(
     componentNames: string[],
     templateName: string,
-    options: CreateOptions
+    options: Partial<CreateOptions>
   ): Promise<GenerateResult[]> {
     if (!this.workspace) throw new OutsideWorkspaceError();
     await this.loadAspects();
-    const { namespace, aspect: aspectId } = options;
-    const templateWithId = await this.getComponentTemplate(templateName, aspectId);
+    const { namespace, aspect } = options;
+
+    const componentConfigLoadingRegistry = ComponentConfig.componentConfigLoadingRegistry;
+
+    const templateWithId = await this.getComponentTemplate(templateName, aspect);
+
+    ComponentConfig.componentConfigLoadingRegistry = componentConfigLoadingRegistry;
+
     if (!templateWithId) throw new BitError(`template "${templateName}" was not found`);
 
     const componentIds = componentNames.map((componentName) =>
       this.newComponentHelper.getNewComponentId(componentName, namespace, options.scope)
     );
+
+    const envId = await this.getEnvIdFromTemplateWithId(templateWithId);
 
     const componentGenerator = new ComponentGenerator(
       this.workspace,
@@ -276,16 +322,37 @@ export class GeneratorMain {
       this.envs,
       this.newComponentHelper,
       this.tracker,
+      this.wsConfigFiles,
+      this.logger,
+      this.onComponentCreateSlot,
       templateWithId.id,
-      templateWithId.envName ? ComponentID.fromString(templateWithId.id) : undefined
+      envId
     );
     return componentGenerator.generate();
+  }
+
+  private async getEnvIdFromTemplateWithId(templateWithId: ComponentTemplateWithId): Promise<ComponentID | undefined> {
+    const envIdFromTemplate = templateWithId.template.env;
+    if (envIdFromTemplate) {
+      const parsedFromTemplate = ComponentID.tryFromString(envIdFromTemplate);
+      if (!parsedFromTemplate) {
+        throw new BitError(
+          `Error: unable to parse envId from template. template name: ${templateWithId.template.name}, envId: ${envIdFromTemplate}`
+        );
+      }
+      const resolvedId = await this.workspace.resolveEnvIdWithPotentialVersionForConfig(parsedFromTemplate);
+      return ComponentID.fromString(resolvedId);
+    }
+    if (templateWithId.envName) {
+      return ComponentID.fromString(templateWithId.id);
+    }
+    return Promise.resolve(undefined);
   }
 
   async generateWorkspaceTemplate(
     workspaceName: string,
     templateName: string,
-    options: NewOptions
+    options: NewOptions & { aspect?: string; currentDir?: boolean }
   ): Promise<GenerateWorkspaceTemplateResult> {
     if (this.workspace) {
       throw new BitError('Error: unable to generate a new workspace inside of an existing workspace');
@@ -298,12 +365,11 @@ export class GeneratorMain {
     if (!workspaceTemplate) throw new BitError(`template "${templateName}" was not found`);
     const workspaceGenerator = new WorkspaceGenerator(workspaceName, options, workspaceTemplate, aspect);
     const workspacePath = await workspaceGenerator.generate();
-
     return { workspacePath, appName: workspaceTemplate.appName };
   }
 
   private async getAllComponentTemplatesDescriptorsFlattened(aspectId?: string): Promise<Array<TemplateDescriptor>> {
-    const envTemplates = await this.listEnvComponentTemplateDescriptors();
+    const envTemplates = await this.listEnvComponentTemplateDescriptors([], aspectId);
     if (envTemplates && envTemplates.length) {
       if (!aspectId) return envTemplates;
       const filtered = envTemplates.filter((template) => template.aspectId === aspectId);
@@ -370,8 +436,8 @@ export class GeneratorMain {
   /**
    * list all component templates registered by an env.
    */
-  async listEnvComponentTemplateDescriptors(ids: string[] = []): Promise<TemplateDescriptor[]> {
-    const envTemplates = await this.listEnvComponentTemplates(ids);
+  async listEnvComponentTemplateDescriptors(ids: string[] = [], aspectId?: string): Promise<TemplateDescriptor[]> {
+    const envTemplates = await this.listEnvComponentTemplates(ids, aspectId);
     const templates: TemplateDescriptor[] = envTemplates.map((envTemplate) => {
       const componentId = ComponentID.fromString(envTemplate.id);
       return {
@@ -384,9 +450,21 @@ export class GeneratorMain {
     return templates;
   }
 
-  async listEnvComponentTemplates(ids: string[] = []): Promise<Array<ComponentTemplateWithId>> {
+  getConfiguredEnvs(): string[] {
+    return this.config.envs ?? [];
+  }
+
+  async listEnvComponentTemplates(ids: string[] = [], aspectId?: string): Promise<Array<ComponentTemplateWithId>> {
     const configEnvs = this.config.envs || [];
-    const envs = await this.loadEnvs(configEnvs?.concat(ids));
+    let remoteEnvsAspect;
+    let fullAspectId;
+    if (aspectId && !configEnvs.includes(aspectId)) {
+      const globals = await this.getGlobalGeneratorEnvs(aspectId);
+      remoteEnvsAspect = globals.remoteEnvsAspect;
+      fullAspectId = globals.fullAspectId;
+    }
+    const allIds = configEnvs?.concat(ids).concat([aspectId, fullAspectId]).filter(Boolean);
+    const envs = await this.loadEnvs(allIds, remoteEnvsAspect);
     const templates = envs.flatMap((env) => {
       if (!env.env.getGeneratorTemplates) return [];
       const tpls = env.env.getGeneratorTemplates() || [];
@@ -429,7 +507,11 @@ export class GeneratorMain {
     this.aspectLoaded = true;
   }
 
-  static slots = [Slot.withType<ComponentTemplate[]>(), Slot.withType<WorkspaceTemplate[]>()];
+  static slots = [
+    Slot.withType<ComponentTemplate[]>(),
+    Slot.withType<WorkspaceTemplate[]>(),
+    Slot.withType<OnComponentCreateFn>(),
+  ];
 
   static dependencies = [
     WorkspaceAspect,
@@ -438,51 +520,79 @@ export class GeneratorMain {
     EnvsAspect,
     AspectLoaderAspect,
     NewComponentHelperAspect,
-    CommunityAspect,
     ComponentAspect,
     TrackerAspect,
+    LoggerAspect,
+    GitAspect,
+    WorkspaceConfigFilesAspect,
   ];
 
   static runtime = MainRuntime;
 
   static async provider(
-    [workspace, cli, graphql, envs, aspectLoader, newComponentHelper, community, componentAspect, tracker]: [
+    [
+      workspace,
+      cli,
+      graphql,
+      envs,
+      aspectLoader,
+      newComponentHelper,
+      componentAspect,
+      tracker,
+      loggerMain,
+      git,
+      wsConfigFiles,
+    ]: [
       Workspace,
       CLIMain,
       GraphqlMain,
       EnvsMain,
       AspectLoaderMain,
       NewComponentHelperMain,
-      CommunityMain,
       ComponentMain,
-      TrackerMain
+      TrackerMain,
+      LoggerMain,
+      GitMain,
+      WorkspaceConfigFilesMain
     ],
     config: GeneratorConfig,
-    [componentTemplateSlot, workspaceTemplateSlot]: [ComponentTemplateSlot, WorkspaceTemplateSlot]
+    [componentTemplateSlot, workspaceTemplateSlot, onComponentCreateSlot]: [
+      ComponentTemplateSlot,
+      WorkspaceTemplateSlot,
+      OnComponentCreateSlot
+    ]
   ) {
+    const logger = loggerMain.createLogger(GeneratorAspect.id);
     const generator = new GeneratorMain(
       componentTemplateSlot,
       workspaceTemplateSlot,
+      onComponentCreateSlot,
       config,
       workspace,
       envs,
       aspectLoader,
       newComponentHelper,
       componentAspect,
-      tracker
+      tracker,
+      logger,
+      git,
+      wsConfigFiles
     );
-    const commands = [
-      new CreateCmd(generator, community.getDocsDomain()),
-      new TemplatesCmd(generator),
-      new NewCmd(generator),
-    ];
+    const commands = [new CreateCmd(generator), new TemplatesCmd(generator), new NewCmd(generator)];
     cli.register(...commands);
     graphql.register(generatorSchema(generator));
     aspectLoader.registerPlugins([new StarterPlugin(generator)]);
     envs.registerService(new GeneratorService());
 
     if (generator)
-      generator.registerComponentTemplate([componentGeneratorTemplate, starterTemplate, workspaceGeneratorTemplate]);
+      generator.registerComponentTemplate([
+        componentGeneratorTemplate,
+        componentGeneratorTemplateStandalone,
+        starterTemplate,
+        starterTemplateStandalone,
+      ]);
+    generator.registerWorkspaceTemplate([BasicWorkspaceStarter]);
+
     return generator;
   }
 }

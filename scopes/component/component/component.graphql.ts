@@ -45,6 +45,7 @@ export function componentSchema(componentExtension: ComponentMain) {
 
       type LogEntry {
         message: String!
+        displayName: String
         username: String
         parents: [String]!
         email: String
@@ -52,6 +53,7 @@ export function componentSchema(componentExtension: ComponentMain) {
         hash: String!
         tag: String
         id: String!
+        profileImage: String
       }
 
       type Author {
@@ -118,6 +120,12 @@ export function componentSchema(componentExtension: ComponentMain) {
         ): [LogEntry]!
 
         aspects(include: [String]): [Aspect]
+
+        """
+        element url of the component - this is deprecated, and will return empty string now.
+        it's here to not break old queries
+        """
+        elementsUrl: String @deprecated(reason: "Not in use anymore")
       }
 
       type Aspect {
@@ -168,7 +176,8 @@ export function componentSchema(componentExtension: ComponentMain) {
             ...snap,
             date: snap.timestamp.getTime(),
             email: snap.author.email,
-            username: snap.author.displayName,
+            username: snap.author.name,
+            displayName: snap.author.displayName,
             id: snap.hash,
           };
         },
@@ -191,6 +200,8 @@ export function componentSchema(componentExtension: ComponentMain) {
         aspects: (component: Component, { include }: { include?: string[] }) => {
           return component.state.aspects.filter(include).serialize();
         },
+        // Here only to not break old queries
+        elementsUrl: () => undefined,
         logs: async (
           component: Component,
           filter?: {

@@ -1,12 +1,12 @@
 import { BitError } from '@teambit/bit-error';
 import { LaneId, DEFAULT_LANE, LANE_REMOTE_DELIMITER } from '@teambit/lane-id';
+import { ComponentID } from '@teambit/component-id';
 import { Scope } from '..';
 import { LaneNotFound } from '../../api/scope/lib/exceptions/lane-not-found';
-import { BitId } from '../../bit-id';
 import logger from '../../logger/logger';
 import { Lane } from '../models';
 import { Repository } from '../objects';
-import { IndexType, LaneItem } from '../objects/components-index';
+import { IndexType, LaneItem } from '../objects/scope-index';
 import { ScopeJson, TrackLane } from '../scope-json';
 import { Log } from '../models/lane';
 
@@ -42,6 +42,27 @@ export default class Lanes {
     await this.objects.writeObjectsToTheFS([laneObject]);
   }
 
+  async renameLane(lane: Lane, newName: string) {
+    // change tracking data
+    const oldName = lane.name;
+    const afterTrackData = {
+      localLane: newName,
+      remoteLane: newName,
+      remoteScope: lane.scope,
+    };
+    this.trackLane(afterTrackData);
+    this.removeTrackLane(oldName);
+
+    // rename the lane in the "new" prop
+    if (lane.isNew) {
+      this.scopeJson.lanes.new = this.scopeJson.lanes.new.map((l) => (l === oldName ? newName : l));
+    }
+
+    // change the lane object
+    lane.name = newName;
+    await this.saveLane(lane);
+  }
+
   getAliasByLaneId(laneId: LaneId): string | null {
     return this.getLocalTrackedLaneByRemoteName(laneId.name, laneId.scope);
   }
@@ -75,13 +96,18 @@ export default class Lanes {
 
   async removeLanes(scope: Scope, lanes: string[], force: boolean, currentLaneName?: string): Promise<string[]> {
     const existingLanes = await this.listLanes();
-    const lanesToRemove: Lane[] = lanes.map((laneName) => {
-      if (laneName === DEFAULT_LANE) throw new BitError(`unable to remove the default lane "${DEFAULT_LANE}"`);
-      if (laneName === currentLaneName) throw new BitError(`unable to remove the currently used lane "${laneName}"`);
-      const existingLane = existingLanes.find((l) => l.name === laneName);
-      if (!existingLane) throw new LaneNotFound(scope.name, laneName);
-      return existingLane;
-    });
+
+    const lanesToRemove: Lane[] = await Promise.all(
+      lanes.map(async (laneName) => {
+        if (laneName === DEFAULT_LANE) throw new BitError(`unable to remove the default lane "${DEFAULT_LANE}"`);
+        if (laneName === currentLaneName) throw new BitError(`unable to remove the currently used lane "${laneName}"`);
+        const laneId = await this.parseLaneIdFromString(laneName);
+        const existingLane = existingLanes.find((l) => l.toLaneId().isEqual(laneId));
+        if (!existingLane) throw new LaneNotFound(scope.name, laneName);
+        return existingLane;
+      })
+    );
+
     if (!force) {
       await Promise.all(
         lanesToRemove.map(async (laneObj) => {
@@ -96,9 +122,9 @@ export default class Lanes {
     }
     await this.objects.moveObjectsToTrash(lanesToRemove.map((l) => l.hash()));
 
-    // const compIdsFromDeletedLanes = BitIds.uniqFromArray(lanesToRemove.map((l) => l.toBitIds()).flat());
+    // const compIdsFromDeletedLanes = ComponentIdList.uniqFromArray(lanesToRemove.map((l) => l.toBitIds()).flat());
     // const notDeletedLanes = existingLanes.filter((l) => !lanes.includes(l.name));
-    // const compIdsFromNonDeletedLanes = BitIds.uniqFromArray(notDeletedLanes.map((l) => l.toBitIds()).flat());
+    // const compIdsFromNonDeletedLanes = ComponentIdList.uniqFromArray(notDeletedLanes.map((l) => l.toBitIds()).flat());
     // const pendingDeleteCompIds = compIdsFromDeletedLanes.filter(
     //   (id) => !compIdsFromNonDeletedLanes.hasWithoutVersion(id)
     // );
@@ -132,7 +158,7 @@ export default class Lanes {
     const allLanes = await this.listLanes();
     const foundWithSameName = allLanes.filter((lane) => lane.name === name);
     if (foundWithSameName.length === 0) {
-      throw new BitError(`unable to find a lane with the name "${name}"`);
+      throw new LaneNotFound('', name);
     }
     if (foundWithSameName.length > 1) {
       throw new BitError(
@@ -207,9 +233,20 @@ export type LaneData = {
   remote: string | null;
   id: LaneId;
   alias?: string | null;
-  components: Array<{ id: BitId; head: string }>;
+  components: Array<{ id: ComponentID; head: string }>;
   isMerged: boolean | null;
-  readmeComponent?: { id: BitId; head?: string };
+  readmeComponent?: { id: ComponentID; head?: string };
   log?: Log;
   hash: string;
 };
+
+export function serializeLaneData(laneData: LaneData) {
+  return {
+    ...laneData,
+    components: laneData.components.map((c) => ({ id: c.id.toString(), head: c.head })),
+    readmeComponent: laneData.readmeComponent && {
+      id: laneData.readmeComponent.id.toString(),
+      head: laneData.readmeComponent.head,
+    },
+  };
+}

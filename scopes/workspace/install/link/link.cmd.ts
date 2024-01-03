@@ -15,6 +15,7 @@ type LinkCommandOpts = {
   verbose: boolean;
   target: string;
   skipFetchingObjects?: boolean;
+  peers?: boolean;
 };
 export class LinkCommand implements Command {
   name = 'link [component-names...]';
@@ -32,9 +33,10 @@ export class LinkCommand implements Command {
     [
       '',
       'target <dir>',
-      'EXPERIMENTAL. link to an external directory (similar to npm-link) so other projects could use these components',
+      'link to an external directory (similar to npm-link) so other projects could use these components',
     ],
     ['', 'skip-fetching-objects', 'skip fetch missing objects from remotes before linking'],
+    ['', 'peers', 'link peer dependencies of the components too'],
   ] as CommandOptions;
 
   constructor(
@@ -47,12 +49,8 @@ export class LinkCommand implements Command {
     /**
      * logger extension.
      */
-    private logger: Logger,
-
-    private docsDomain: string
-  ) {
-    this.extendedDescription = `https://${this.docsDomain}/workspace/component-links`;
-  }
+    private logger: Logger
+  ) {}
 
   async report([ids]: [string[]], opts: LinkCommandOpts) {
     const startTime = Date.now();
@@ -95,6 +93,7 @@ export class LinkCommand implements Command {
       linkTeambitBit: true,
       linkToDir: opts.target,
       fetchObject: !opts.skipFetchingObjects,
+      includePeers: opts.peers,
     };
     const linkResults = await this.install.link(linkOpts);
     return linkResults;

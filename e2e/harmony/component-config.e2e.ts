@@ -112,7 +112,7 @@ describe('component config', function () {
         helper.componentJson.deleteIfExist('bar');
         helper.fixtures.copyFixtureExtensions(EXTENSION_FOLDER);
         helper.command.addComponent(EXTENSION_FOLDER);
-        helper.extensions.addExtensionToVariant('bar', 'my-scope/dummy-extension', config);
+        helper.extensions.addExtensionToVariant('bar', 'my-scope/dummy-extension', config, true);
         helper.extensions.addExtensionToVariant(EXTENSION_FOLDER, 'teambit.harmony/aspect');
         helper.command.install();
         helper.command.compile();
@@ -222,14 +222,14 @@ describe('component config', function () {
   });
 });
 
-function getExtensionEntry(extensionId: string, config: any): any {
+function getExtensionEntry(extensionName: string, config: any): any {
   return {
-    extensionId,
+    extensionId: `my-scope/${extensionName}`,
     config,
     newExtensionId: {
-      legacyComponentId: {
+      _legacy: {
         scope: null,
-        name: extensionId,
+        name: extensionName,
         version: 'latest',
       },
       _scope: 'my-scope',

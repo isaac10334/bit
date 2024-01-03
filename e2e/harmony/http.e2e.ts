@@ -53,13 +53,15 @@ import { HttpHelper } from '../http-helper';
     });
     // previously it was throwing UnexpectedNetworkError without any message.
     it('bit lane remove -r of a non-existing lane should throw a descriptive error', () => {
-      expect(() => helper.command.removeRemoteLane('non-exist')).to.throw('lane "non-exist" was not found');
+      expect(() => helper.command.removeRemoteLane('non-exist')).to.throw(
+        `lane "${helper.scopes.remote}/non-exist" was not found`
+      );
     });
     after(() => {
       httpHelper.killHttp();
     });
   });
-  describe('export with removed components', () => {
+  describe('export with deleted components', () => {
     before(async () => {
       httpHelper = new HttpHelper(helper);
       helper.scopeHelper.setNewLocalAndRemoteScopes();
@@ -68,13 +70,19 @@ import { HttpHelper } from '../http-helper';
       helper.fixtures.populateComponents(2);
       helper.command.snapAllComponentsWithoutBuild();
       helper.command.export();
-      helper.command.removeComponent('comp2', '--soft');
+      helper.command.softRemoveComponent('comp2');
       helper.fs.outputFile('comp1/index.js', '');
       helper.command.snapAllComponentsWithoutBuild();
       helper.command.export();
     });
     it('bit list -r should show not show the removed component', () => {
       const list = helper.command.listRemoteScopeParsed();
+      expect(list).to.have.lengthOf(1);
+      expect(list[0].id).to.not.have.string('comp2');
+    });
+    it('bit import of the entire scope should not bring in the deleted components', () => {
+      helper.command.importComponent('*', '-x');
+      const list = helper.command.listParsed();
       expect(list).to.have.lengthOf(1);
       expect(list[0].id).to.not.have.string('comp2');
     });
@@ -129,12 +137,12 @@ import { HttpHelper } from '../http-helper';
         helper.scopeHelper.getClonedLocalScope(scopeAfterExport);
       });
       it('should show descriptive error when removing component that has dependents', () => {
-        const output = helper.command.removeComponent(`${helper.scopes.remote}/comp2`, '--remote');
+        const output = helper.command.removeComponentFromRemote(`${helper.scopes.remote}/comp2`);
         expect(output).to.have.string(`error: unable to delete ${helper.scopes.remote}/comp2`);
         expect(output).to.have.string(`${helper.scopes.remote}/comp1`);
       });
       it('should remove successfully components that has no dependents', () => {
-        const output = helper.command.removeComponent(`${helper.scopes.remote}/comp1`, '--remote');
+        const output = helper.command.removeComponentFromRemote(`${helper.scopes.remote}/comp1`);
         expect(output).to.have.string('successfully removed components');
         expect(output).to.have.string('comp1');
       });

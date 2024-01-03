@@ -21,6 +21,7 @@ export class ESLintLinter implements Linter {
     private ESLint?: any
   ) {}
 
+  id = 'eslint-linter';
   displayName = 'ESlint';
 
   displayConfig() {

@@ -1,6 +1,6 @@
 import { readFileSync } from 'fs';
 import { join, resolve, basename } from 'path';
-import { Application, AppContext, AppBuildContext, AppResult } from '@teambit/application';
+import { Application, AppContext, AppBuildContext, AppResult, ApplicationInstance } from '@teambit/application';
 import type { Bundler, DevServer, BundlerContext, DevServerContext, BundlerHtmlConfig } from '@teambit/bundler';
 import { Port } from '@teambit/toolbox.network.get-port';
 import { ComponentMap } from '@teambit/component';
@@ -35,25 +35,42 @@ export class ReactApp implements Application {
     readonly devServer?: DevServer,
     readonly transformers: WebpackConfigTransformer[] = [],
     readonly deploy?: (context: ReactDeployContext) => Promise<void>,
-    readonly favicon?: string
+    readonly favicon?: string,
+    readonly webpackModulePath?: string,
+    readonly webpackDevServerModulePath?: string
   ) {}
   readonly applicationType = 'react-common-js';
   readonly dir = 'public';
   readonly ssrDir = 'ssr';
 
-  async run(context: AppContext): Promise<number> {
+  async run(context: AppContext): Promise<ApplicationInstance> {
     const [from, to] = this.portRange;
-    const port = await Port.getPort(from, to);
+    const port = context.port || (await Port.getPort(from, to));
 
     if (this.devServer) {
       await this.devServer.listen(port);
-      return port;
+      this.logger.console(`${context.appName} is listening on http://localhost:${port}`);
+
+      return {
+        appName: context.appName,
+        port,
+      };
     }
 
     const devServerContext = await this.getDevServerContext(context);
-    const devServer = this.reactEnv.getDevServer(devServerContext, [addDevServer, setOutput, ...this.transformers]);
+    const devServer = this.reactEnv.getDevServer(
+      devServerContext,
+      [addDevServer, setOutput, ...this.transformers],
+      this.webpackModulePath,
+      this.webpackDevServerModulePath
+    );
     await devServer.listen(port);
-    return port;
+    this.logger.console(`${context.appName} is listening on http://localhost:${port}`);
+
+    return {
+      appName: context.appName,
+      port,
+    };
   }
 
   async runSsr(context: AppContext): Promise<AppResult> {
@@ -84,6 +101,7 @@ export class ReactApp implements Application {
     });
 
     expressApp.listen(port);
+    this.logger.console(`listening on port ${port}`);
     return { port };
   }
 
@@ -115,10 +133,11 @@ export class ReactApp implements Application {
       previousTasksResults: [],
     });
 
-    const bundler = await this.reactEnv.getBundler(ctx, [
-      (config) => config.merge([clientConfig()]),
-      ...this.transformers,
-    ]);
+    const bundler = await this.reactEnv.getBundler(
+      ctx,
+      [(config) => config.merge([clientConfig()]), ...this.transformers],
+      this.webpackModulePath
+    );
 
     const bundleResult = await bundler.run();
     return bundleResult[0];
@@ -143,10 +162,11 @@ export class ReactApp implements Application {
       previousTasksResults: [],
     });
 
-    const bundler = await this.reactEnv.getBundler(ctx, [
-      (config) => config.merge([ssrConfig()]),
-      ...this.transformers,
-    ]);
+    const bundler = await this.reactEnv.getBundler(
+      ctx,
+      [(config) => config.merge([ssrConfig()]), ...this.transformers],
+      this.webpackModulePath
+    );
 
     const bundleResult = await bundler.run();
     return bundleResult[0];
@@ -246,7 +266,7 @@ export class ReactApp implements Application {
     ]);
 
     const reactEnv = context.env as ReactEnv;
-    const bundler: Bundler = await reactEnv.getBundler(bundlerContext, transformers);
+    const bundler: Bundler = await reactEnv.getBundler(bundlerContext, transformers, this.webpackModulePath);
     return bundler;
   }
 
@@ -263,7 +283,7 @@ export class ReactApp implements Application {
     ]);
 
     const reactEnv = context.env as ReactEnv;
-    const bundler: Bundler = await reactEnv.getBundler(bundlerContext, transformers);
+    const bundler: Bundler = await reactEnv.getBundler(bundlerContext, transformers, this.webpackModulePath);
     return bundler;
   }
 

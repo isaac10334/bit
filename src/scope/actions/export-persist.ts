@@ -1,5 +1,5 @@
+import { ComponentIdList } from '@teambit/component-id';
 import { Scope } from '..';
-import { BitIds } from '../../bit-id';
 import logger from '../../logger/logger';
 import { saveObjects } from '../component-ops/export-scope-components';
 import { Lane } from '../models';
@@ -17,14 +17,14 @@ export class ExportPersist implements Action<Options, string[]> {
     const objectList = await scope.readObjectsFromPendingDir(options.clientId);
 
     logger.debug(`ExportPersist, going to merge ${objectList.objects.length} objects`);
-    const bitIds: BitIds = await saveObjects(scope, objectList);
+    const bitIds: ComponentIdList = await saveObjects(scope, objectList);
 
     const componentsIds: string[] = bitIds.map((id) => id.toString());
     await scope.removePendingDir(options.clientId);
     if (ExportPersist.onPutHook) {
       const lanes = (await objectList.toBitObjects()).getLanes();
       ExportPersist.onPutHook(componentsIds, lanes, authData).catch((err) => {
-        logger.error('fatal: onPutHook encountered an error (this error does not stop the process)', err);
+        logger.error(`fatal: ExportPersist.onPutHook encountered an error (this error does not stop the process)`, err);
         // let the process continue. we don't want to stop it when onPutHook failed.
       });
     }

@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { DEFAULT_LANE } from '@teambit/lane-id';
 import { Command, CommandOptions } from '@teambit/cli';
+import { fromBase64 } from '@teambit/legacy/dist/utils';
 import { BitError } from '@teambit/bit-error';
 import { MergeLanesMain } from './merge-lanes.main.runtime';
 
@@ -10,6 +11,8 @@ type Flags = {
   keepReadme?: boolean;
   noSquash: boolean;
   includeDeps?: boolean;
+  title?: string;
+  titleBase64?: string;
 };
 
 /**
@@ -34,10 +37,16 @@ the lane must be up-to-date with the other lane, otherwise, conflicts might occu
   alias = '';
   options = [
     ['', 'pattern <string>', 'partially merge the lane with the specified component-pattern'],
+    [
+      '',
+      'title <string>',
+      'if provided, it replaces the original message with this title and append squashed snaps messages',
+    ],
+    ['', 'title-base64 <string>', 'same as --title flag but the title is base64 encoded'],
     ['', 'push', 'export the updated objects to the original scopes once done'],
     ['', 'keep-readme', 'skip deleting the lane readme component after merging'],
-    ['', 'no-squash', 'EXPERIMENTAL. relevant for merging lanes into main, which by default squash.'],
-    ['', 'include-deps', 'EXPERIMENTAL. relevant for "--pattern". merge also dependencies of the given components'],
+    ['', 'no-squash', 'relevant for merging lanes into main, which by default squash.'],
+    ['', 'include-deps', 'relevant for "--pattern". merge also dependencies of the given components'],
     ['j', 'json', 'output as json format'],
   ] as CommandOptions;
   loader = true;
@@ -49,11 +58,13 @@ the lane must be up-to-date with the other lane, otherwise, conflicts might occu
 
   async report(
     [fromLane, toLane]: [string, string],
-    { pattern, push = false, keepReadme = false, noSquash = false, includeDeps = false }: Flags
+    { pattern, push = false, keepReadme = false, noSquash = false, includeDeps = false, title, titleBase64 }: Flags
   ): Promise<string> {
     if (includeDeps && !pattern) {
       throw new BitError(`"--include-deps" flag is relevant only for --pattern flag`);
     }
+
+    const titleBase64Decoded = titleBase64 ? fromBase64(titleBase64) : undefined;
 
     const { mergedNow, mergedPreviously, exportedIds } = await this.mergeLanes.mergeFromScope(
       fromLane,
@@ -64,6 +75,7 @@ the lane must be up-to-date with the other lane, otherwise, conflicts might occu
         noSquash,
         pattern,
         includeDeps,
+        snapMessage: titleBase64Decoded || title,
       }
     );
 

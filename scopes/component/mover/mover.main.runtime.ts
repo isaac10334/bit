@@ -44,7 +44,7 @@ export class MoverMain {
       const componentsIds = changes.map((c) => c.id);
       await linkToNodeModulesByIds(this.workspace, componentsIds);
     }
-    await this.workspace.bitMap.write();
+    await this.workspace.bitMap.write('move');
     return changes;
   }
 
@@ -63,7 +63,7 @@ export class MoverMain {
     component.dataToPersist.files.forEach((file) => {
       // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
       const newRelative = file.relative.replace(oldPathRelative, newPathRelative);
-      file.updatePaths({ newRelative });
+      file.updatePaths({ newRelative, newBase: newPathRelative });
     });
     component.dataToPersist.removePath(new RemovePath(oldPathRelative));
     component.writtenPath = newPathRelative;

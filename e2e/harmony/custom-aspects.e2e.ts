@@ -4,6 +4,8 @@ import NpmCiRegistry, { supportNpmCiRegistryTesting } from '../npm-ci-registry';
 
 chai.use(require('chai-fs'));
 
+const MAIN_ASPECT_PROVIDER_TEXT = 'main aspect provider';
+
 describe('custom aspects', function () {
   this.timeout(0);
   let helper: Helper;
@@ -27,9 +29,9 @@ describe('custom aspects', function () {
       npmCiRegistry = new NpmCiRegistry(helper);
       await npmCiRegistry.init();
       npmCiRegistry.configureCiInPackageJsonHarmony();
-      helper.command.create('aspect', 'dep-dep-aspect');
-      helper.command.create('aspect', 'dep-aspect');
-      helper.command.create('aspect', 'main-aspect');
+      helper.command.create('bit-aspect', 'dep-dep-aspect');
+      helper.command.create('bit-aspect', 'dep-aspect');
+      helper.command.create('bit-aspect', 'main-aspect');
       helper.fs.outputFile(
         `${helper.scopes.remoteWithoutOwner}/dep-aspect/dep-aspect.main.runtime.ts`,
         getDepAspect(helper.scopes.remoteWithoutOwner)
@@ -79,19 +81,21 @@ describe('custom aspects', function () {
   });
   describe('aspect with another aspect as regular dep', function () {
     let output;
-    const LOADING_MSG = 'loading ext2';
+    const LOADING_MSG_1 = 'loading ext1';
+    const LOADING_MSG_2 = 'loading ext2';
     before(() => {
       helper = new Helper();
       helper.scopeHelper.setNewLocalAndRemoteScopes();
       helper.bitJsonc.setPackageManager();
       helper.fixtures.populateExtensions(2, true);
       helper.extensions.addExtensionToVariant('extensions', 'teambit.harmony/aspect');
-      helper.command.create('aspect', 'main-aspect');
+      helper.command.create('bit-aspect', 'main-aspect');
       helper.fs.outputFile(
         `${helper.scopes.remoteWithoutOwner}/main-aspect/main-aspect.main.runtime.ts`,
         getMainAspectWithRegularDep(helper.scopes.remoteWithoutOwner)
       );
-      helper.fs.prependFile('extensions/ext2/ext2.main.runtime.ts', `console.log('${LOADING_MSG}');`);
+      helper.fs.prependFile('extensions/ext1/ext1.main.runtime.ts', `console.log('${LOADING_MSG_1}');`);
+      helper.fs.prependFile('extensions/ext2/ext2.main.runtime.ts', `console.log('${LOADING_MSG_2}');`);
       helper.command.install();
       helper.command.compile();
       helper.command.use('main-aspect');
@@ -100,19 +104,44 @@ describe('custom aspects', function () {
     after(() => {
       helper.scopeHelper.destroy();
     });
-    it('should run main aspect provider', () => {
-      expect(output).to.have.string('main-aspect');
+    describe('when the dep aspect is not configured in workspace.jsonc', function () {
+      it('should run main aspect provider', () => {
+        expect(output).to.have.string(MAIN_ASPECT_PROVIDER_TEXT);
+      });
+      it('should not load at all aspect which is static dep but not configured in workspace.jsonc', () => {
+        expect(output).to.not.have.string(LOADING_MSG_1);
+      });
+      it('should not run aspect which is static dep but not configured in workspace.j', () => {
+        expect(output).to.not.have.string('ext 1');
+      });
+      it('should not load at all aspect which is regular dep provider', () => {
+        expect(output).to.not.have.string(LOADING_MSG_2);
+      });
+      it('should not run aspect which is regular dep provider', () => {
+        expect(output).to.not.have.string('ext 2');
+      });
     });
-    it('should run aspect dep provider', () => {
-      expect(output).to.have.string('ext 1');
-    });
-    // @todo currently this is failing, although the aspect is not loaded through Harmony,
-    // the manifest is retrieved by running "require" on the main file. another optimization is needed to fix this.
-    it.skip('should not load at all aspect which is regular dep provider', () => {
-      expect(output).to.not.have.string(LOADING_MSG);
-    });
-    it('should not run aspect which is regular dep provider', () => {
-      expect(output).to.not.have.string('ext 2');
+
+    describe('when the dep aspect is configured in workspace.jsonc', function () {
+      before(() => {
+        helper.command.use('ext1');
+        output = helper.command.showComponent('main-aspect');
+      });
+      it('should run main aspect provider', () => {
+        expect(output).to.have.string(MAIN_ASPECT_PROVIDER_TEXT);
+      });
+      it('should load aspect dep provider', () => {
+        expect(output).to.have.string(LOADING_MSG_1);
+      });
+      it('should run aspect dep provider', () => {
+        expect(output).to.have.string('ext 1');
+      });
+      it('should not load at all aspect which is regular dep provider', () => {
+        expect(output).to.not.have.string(LOADING_MSG_2);
+      });
+      it('should not run aspect which is regular dep provider', () => {
+        expect(output).to.not.have.string('ext 2');
+      });
     });
   });
   (supportNpmCiRegistryTesting ? describe : describe.skip)('simple case of using an external aspect', () => {
@@ -124,7 +153,7 @@ describe('custom aspects', function () {
       npmCiRegistry = new NpmCiRegistry(helper);
       await npmCiRegistry.init();
       npmCiRegistry.configureCiInPackageJsonHarmony();
-      helper.command.create('aspect', 'my-aspect');
+      helper.command.create('bit-aspect', 'my-aspect');
       helper.command.compile();
       helper.command.install();
       helper.command.tagAllComponents();
@@ -228,7 +257,7 @@ function getMainAspectWithRegularDep(remoteScope: string) {
     static dependencies = [Ext1Aspect];
     static runtime = MainRuntime;
     static async provider([ext1Aspect]: [Ext1Main]) {
-      console.log('main aspect');
+      console.log('${MAIN_ASPECT_PROVIDER_TEXT}');
       return new MainAspectMain();
     }
   }

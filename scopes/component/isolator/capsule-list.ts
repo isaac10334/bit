@@ -1,7 +1,7 @@
-import type { Component, ComponentID } from '@teambit/component';
-import { DependencyResolverMain } from '@teambit/dependency-resolver';
+import type { Component } from '@teambit/component';
+import { Dependency, DependencyResolverMain } from '@teambit/dependency-resolver';
 import { Edge, Graph, Node } from '@teambit/graph.cleargraph';
-import { BitId } from '@teambit/legacy-bit-id';
+import { ComponentID } from '@teambit/component-id';
 import { normalize } from 'path';
 import { Capsule } from './capsule';
 
@@ -9,14 +9,11 @@ export default class CapsuleList extends Array<Capsule> {
   getCapsule(id: ComponentID): Capsule | undefined {
     return this.find((capsule) => capsule.component.id.isEqual(id));
   }
-  getCapsuleByLegacyId(id: BitId): Capsule | undefined {
-    return this.find((capsule) => capsule.component.id._legacy.isEqual(id));
+  getCapsuleByLegacyId(id: ComponentID): Capsule | undefined {
+    return this.find((capsule) => capsule.component.id.isEqual(id));
   }
   getCapsuleIgnoreVersion(id: ComponentID): Capsule | undefined {
     return this.find((capsule) => capsule.component.id.isEqual(id, { ignoreVersion: true }));
-  }
-  getCapsuleIgnoreScopeAndVersion(id: ComponentID): Capsule | undefined {
-    return this.find((capsule) => capsule.component.id._legacy.isEqualWithoutScopeAndVersion(id._legacy));
   }
   getAllCapsuleDirs(): string[] {
     return this.map((capsule) => capsule.path);
@@ -34,15 +31,17 @@ export default class CapsuleList extends Array<Capsule> {
     const components = this.getAllComponents();
     const graph = new Graph<Component, string>();
 
-    components.forEach((comp) => graph.setNode(new Node(comp.id.toString(), comp)));
+    // Build a graph with all the components from the current capsule list
+    components.forEach((comp: Component) => graph.setNode(new Node(depResolver.getPackageName(comp), comp)));
 
-    for (const comp of components) {
+    // Add edges between the components according to their interdependencies
+    for (const node of graph.nodes) {
       // eslint-disable-next-line no-await-in-loop
-      const deps = await depResolver.getComponentDependencies(comp);
-      deps.forEach((dep) => {
-        const depCompId = dep.componentId;
-        if (graph.hasNode(depCompId.toString())) {
-          graph.setEdge(new Edge(comp.id.toString(), depCompId.toString(), dep.lifecycle));
+      const deps = await depResolver.getDependencies(node.attr);
+      deps.forEach((dep: Dependency) => {
+        const depPkgName = dep.getPackageName?.();
+        if (depPkgName && graph.hasNode(depPkgName)) {
+          graph.setEdge(new Edge(node.id, depPkgName, dep.lifecycle));
         }
       });
     }

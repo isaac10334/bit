@@ -19,12 +19,9 @@ import CatScope from './commands/private-cmds/cat-scope-cmd';
 import DependencyStatus from './commands/private-cmds/dependency-status-cmd';
 import Migrate from './commands/private-cmds/migrate-cmd';
 import Config from './commands/public-cmds/config-cmd';
-import Diff from './commands/public-cmds/diff-cmd';
 import Doctor from './commands/public-cmds/doctor-cmd';
 import Init from './commands/public-cmds/init-cmd';
 import Dependents from './commands/public-cmds/dependents-cmd';
-import Login from './commands/public-cmds/login-cmd';
-import Logout from './commands/public-cmds/logout-cmd';
 import Remote from './commands/public-cmds/remote-cmd';
 import ScopeConfig from './commands/public-cmds/scope-config-cmd';
 import Untag from './commands/public-cmds/untag-cmd';
@@ -61,11 +58,6 @@ export default function registerCommands(): CommandRegistry {
     new Untag(),
     new Delete(),
     new Latest(),
-    // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
-    new Diff(),
-    // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
-    new Login(),
-    new Logout(),
     // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!
     new Migrate(),
     // @ts-ignore AUTO-ADDED-AFTER-MIGRATION-PLEASE-FIX!

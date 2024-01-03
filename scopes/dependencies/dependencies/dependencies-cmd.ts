@@ -3,11 +3,6 @@ import { Command, CommandOptions } from '@teambit/cli';
 import Table from 'cli-table';
 import chalk from 'chalk';
 import archy from 'archy';
-import {
-  dependencies,
-  DependenciesResultsDebug,
-  DependenciesResults,
-} from '@teambit/legacy/dist/api/consumer/lib/dependencies';
 import { generateDependenciesInfoTable } from '@teambit/legacy/dist/cli/templates/component-template';
 import { IdNotFoundInGraph } from '@teambit/legacy/dist/scope/exceptions/id-not-found-in-graph';
 import DependencyGraph from '@teambit/legacy/dist/scope/graph/scope-graph';
@@ -20,6 +15,7 @@ type GetDependenciesFlags = {
 
 export type SetDependenciesFlags = {
   dev?: boolean;
+  optional?: boolean;
   peer?: boolean;
 };
 
@@ -33,8 +29,10 @@ export class DependenciesGetCmd implements Command {
   alias = '';
   options = [['t', 'tree', 'EXPERIMENTAL. render dependencies as a tree, similar to "npm ls"']] as CommandOptions;
 
+  constructor(private deps: DependenciesMain) {}
+
   async report([id]: [string], { tree = false }: GetDependenciesFlags) {
-    const results = (await dependencies(id, false)) as DependenciesResults;
+    const results = await this.deps.getDependencies(id);
 
     if (tree) {
       const idWithVersion = results.workspaceGraph._getIdWithLatestVersion(results.id);
@@ -44,7 +42,9 @@ export class DependenciesGetCmd implements Command {
           return archy(graphAsTree);
         } catch (err: any) {
           if (err.constructor.name === 'RangeError') {
-            return `${chalk.red('unable to generate a tree representation, the graph is too big or has cycles')}`;
+            return `${chalk.red(
+              'unable to generate a tree representation, the graph is too big or has cyclic dependencies'
+            )}`;
           }
           throw err;
         }
@@ -86,8 +86,10 @@ export class DependenciesDebugCmd implements Command {
   alias = '';
   options = [] as CommandOptions;
 
+  constructor(private deps: DependenciesMain) {}
+
   async report([id]: [string]) {
-    const results = (await dependencies(id, true)) as DependenciesResultsDebug;
+    const results = await this.deps.debugDependencies(id);
     return JSON.stringify(results, undefined, 4);
   }
 }
@@ -107,6 +109,7 @@ export class DependenciesSetCmd implements Command {
   alias = '';
   options = [
     ['d', 'dev', 'add to the devDependencies'],
+    ['o', 'optional', 'add to the optionalDependencies'],
     ['p', 'peer', 'add to the peerDependencies'],
   ] as CommandOptions;
 
@@ -278,6 +281,43 @@ export class DependenciesBlameCmd implements Command {
   }
 }
 
+type DependenciesUsageCmdOptions = {
+  depth?: number;
+};
+
+export class DependenciesUsageCmd implements Command {
+  name = 'usage <dependency-name>';
+  arguments = [
+    {
+      name: 'dependency-name',
+      description:
+        'package-name. for components, you can use either component-id or package-name. if version is specified, it will search for the exact version',
+    },
+  ];
+  group = 'info';
+  description = 'EXPERIMENTAL. find components that use the specified dependency';
+  alias = '';
+  options = [['', 'depth <number>', 'max display depth of the dependency graph']] as CommandOptions;
+
+  constructor(private deps: DependenciesMain) {}
+
+  async report([depName]: [string], options: DependenciesUsageCmdOptions) {
+    const deepUsageResult = await this.deps.usageDeep(depName, options);
+    if (deepUsageResult != null) return deepUsageResult;
+    const results = await this.deps.usage(depName);
+    if (!Object.keys(results).length) {
+      return chalk.yellow(`the specified dependency ${depName} is not used by any component`);
+    }
+    return Object.keys(results)
+      .map((compIdStr) => `${chalk.bold(compIdStr)} (using dep in version ${results[compIdStr]})`)
+      .join('\n');
+  }
+}
+
+export class WhyCmd extends DependenciesUsageCmd {
+  name = 'why <dependency-name>';
+}
+
 export class DependenciesCmd implements Command {
   name = 'deps <sub-command>';
   alias = 'dependencies';
@@ -285,7 +325,7 @@ export class DependenciesCmd implements Command {
   options = [];
   group = 'info';
   commands: Command[] = [];
-  helpUrl = 'docs/dependencies/configuring-dependencies';
+  helpUrl = 'reference/dependencies/configuring-dependencies';
 
   async report([unrecognizedSubcommand]: [string]) {
     return chalk.red(

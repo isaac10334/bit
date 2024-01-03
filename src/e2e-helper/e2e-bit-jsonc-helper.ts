@@ -42,7 +42,7 @@ export default class BitJsoncHelper {
     bitJsoncDir: string = this.scopes.localPath
   ) {
     const bitJsonc = this.read(bitJsoncDir);
-    const variants = bitJsonc['teambit.workspace/variants'];
+    const variants = bitJsonc['teambit.workspace/variants'] || {};
     const newVariant = replaceExisting ? {} : variants[variant] ?? {};
     assign(newVariant, { [key]: val });
     this.setVariant(bitJsoncDir, variant, newVariant);
@@ -57,7 +57,7 @@ export default class BitJsoncHelper {
    */
   setVariant(bitJsoncDir: string = this.scopes.localPath, variant: string, config: any) {
     const bitJsonc = this.read(bitJsoncDir);
-    const variants = bitJsonc['teambit.workspace/variants'];
+    const variants = bitJsonc['teambit.workspace/variants'] || {};
     const newVariant = config;
     assign(variants, { [variant]: newVariant });
     this.addKeyVal('teambit.workspace/variants', variants, bitJsoncDir);
@@ -115,9 +115,6 @@ export default class BitJsoncHelper {
     this.addKeyValToDependencyResolver('packageManager', packageManager);
   }
 
-  addDefaultOwner(owner: string) {
-    this.addKeyValToWorkspace('defaultOwner', owner);
-  }
   corrupt() {
     const bitJsoncPath = composePath(this.scopes.localPath);
     fs.writeFileSync(bitJsoncPath, '"corrupted');

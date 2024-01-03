@@ -7,14 +7,15 @@ import { ComponentLogMain } from './component-log.main.runtime';
 export default class LogCmd implements Command {
   name = 'log <id>';
   description = 'show components(s) version history';
-  helpUrl = 'docs/components/navigating-history';
+  helpUrl = 'reference/components/navigating-history';
   extendedDescription: string;
   group = 'info';
   alias = '';
   options = [
     ['r', 'remote', 'show log of a remote component'],
-    ['', 'parents', 'EXPERIMENTAL. show parents and lanes data'],
+    ['', 'parents', 'show parents and lanes data'],
     ['o', 'one-line', 'show each log entry in one line'],
+    ['f', 'full-hash', 'show full hash of the snap (default to the first 9 characters for --one-line/--parents flags)'],
     ['j', 'json', 'json format'],
   ] as CommandOptions;
   migration = true;
@@ -22,19 +23,23 @@ export default class LogCmd implements Command {
   skipWorkspace = true;
   arguments = [{ name: 'id', description: 'component-id or component-name' }];
 
-  constructor(private componentLog: ComponentLogMain, docsDomain: string) {
-    this.extendedDescription = `https://${docsDomain}/reference/cli-reference#log`;
-  }
+  constructor(private componentLog: ComponentLogMain) {}
 
   async report(
     [id]: [string],
-    { remote = false, parents = false, oneLine = false }: { remote: boolean; parents: boolean; oneLine?: boolean }
+    {
+      remote = false,
+      parents = false,
+      oneLine = false,
+      fullHash = false,
+    }: { remote: boolean; parents: boolean; oneLine?: boolean; fullHash?: boolean }
   ) {
+    if (!parents && !oneLine) fullHash = true;
     if (parents) {
-      const logs = await this.componentLog.getLogsWithParents(id);
+      const logs = await this.componentLog.getLogsWithParents(id, fullHash);
       return logs.join('\n');
     }
-    const logs = await this.componentLog.getLogs(id, remote);
+    const logs = await this.componentLog.getLogs(id, remote, !fullHash);
     if (oneLine) {
       return logOneLine(logs.reverse());
     }
