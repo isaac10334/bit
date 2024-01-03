@@ -1749,8 +1749,8 @@ importers:
         specifier: 3.0.0
         version: 3.0.0
       npm:
-        specifier: 9.6.0
-        version: 9.6.0
+        specifier: 10.2.5
+        version: 10.2.5
       npm-run-all:
         specifier: 4.1.5
         version: 4.1.5
@@ -67510,18 +67510,21 @@ packages:
     dependencies:
       path-key: 3.1.1
 
-  /npm@9.6.0:
-    resolution: {integrity: sha512-BE7ZFIXSg5iiSrrFvcEDqZuCynfkKjIiLjq3vFgpogu0eMb7S6LUYSUPsSMp4m5ORRme7zDCRnaBdCWrxU3mVg==}
-    engines: {node: ^14.17.0 || ^16.13.0 || >=18.0.0}
+  /npm@10.2.5:
+    resolution: {integrity: sha512-lXdZ7titEN8CH5YJk9C/aYRU9JeDxQ4d8rwIIDsvH3SMjLjHTukB2CFstMiB30zXs4vCrPN2WH6cDq1yHBeJAw==}
+    engines: {node: ^18.17.0 || >=20.5.0}
     hasBin: true
     dev: false
     bundledDependencies:
       - '@isaacs/string-locale-compare'
       - '@npmcli/arborist'
       - '@npmcli/config'
+      - '@npmcli/fs'
       - '@npmcli/map-workspaces'
       - '@npmcli/package-json'
+      - '@npmcli/promise-spawn'
       - '@npmcli/run-script'
+      - '@sigstore/tuf'
       - abbrev
       - archy
       - cacache
@@ -67557,6 +67560,7 @@ packages:
       - ms
       - node-gyp
       - nopt
+      - normalize-package-data
       - npm-audit-report
       - npm-install-checks
       - npm-package-arg
@@ -67571,10 +67575,11 @@ packages:
       - proc-log
       - qrcode-terminal
       - read
-      - read-package-json
-      - read-package-json-fast
       - semver
+      - spdx-expression-parse
       - ssri
+      - strip-ansi
+      - supports-color
       - tar
       - text-table
       - tiny-relative-date
