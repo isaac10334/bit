@@ -25,7 +25,7 @@
 
 [Bit](https://bit.dev) is a complete solution for building **composable software**. It simplifies the creation, maintenance and reuse of software using independent and reusable components.
 
-You can use Bit components to build new projects or reuse components to modernize your existing applications. Here are few examples to components people build with Bit:
+You can use Bit components to build new projects, reuse components, or modernize your existing applications. Here are a few examples of components people build with Bit:
 
 - [Reusable components](#getting-started)
 - [Backend services](https://bit.dev/docs/quick-start/platforms)
@@ -36,7 +36,7 @@ You can use Bit components to build new projects or reuse components to moderniz
 
 Bit supports all tooling in the JS ecosystem and comes out of the box with official dev environments for [NodeJS](https://bit.dev/docs/backend-intro), [React](https://bit.dev/docs/react-intro), [Angular](https://bit.dev/docs/angular-introduction), [Vue](https://bit.dev/docs/vue-intro), [React Native](https://bit.dev/docs/react-native-intro), [NextJS](https://bit.dev/docs/quick-start/hello-world-nextjs) and [far more](https://bit.dev/docs). All are native to TypeScript and ESM and equipped with the best dev tooling.
 
-Bit is a fit to every codebase structure. You can use Bit components in a monorepo, polyrepo, or even without repositories at all. 
+Bit is a fit for every codebase structure. You can use Bit components in a monorepo, polyrepo, or even without repositories at all. 
 
 ## Getting started
 
